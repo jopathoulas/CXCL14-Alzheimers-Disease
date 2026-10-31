@@ -1,0 +1,336 @@
+---
+title: "Analysis of Astrocytes in 7-Month-Old 5xFAD and Wild-Type Mice (Zhou et al.,
+  2020)"
+output: html_document
+date: "2025-12-15"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+```{r}
+## Overview
+
+This R Markdown file documents the analysis of astrocytes from previously published
+mouse cortical single-nucleus RNA-sequencing data attributed to Zhou et al. (2020),
+comparing WT and 5xFAD conditions at approximately 7 months of age.
+
+**Public data source:** Zhou et al., GEO accession [GSE140510](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE140510), 7-month mouse single-nucleus RNA-seq. The analysis uses three WT and three 5xFAD biological replicates (WT1–WT3 and FAD1–FAD3). The downloaded, processed 10x-format count matrices were placed in six corresponding sample folders. Each folder contains `barcodes.tsv.gz`, `features.tsv.gz`, and `matrix.mtx.gz`. In the original local preparation, prefixes were removed from the downloaded filenames to make them compatible with `Read10X()`.
+
+**Input layout:** Place this R Markdown file alongside a `data/` directory containing the six sample folders (or edit `data_dir` below). The raw FASTQ files are **not** needed for this workflow; this analysis starts with the processed count matrices supplied by the original study. This R Markdown now reproduces preparation of the combined starting Seurat object, previously saved as `7m_snRNAseq_combined.rds`.
+
+**Original analytical choices retained:** QC (200–7000 detected genes,
+500–50000 counts, up to 15% mitochondrial reads); per-sample decontX;
+removal of cells with estimated contamination above 0.30; per-sample
+scDblFinder singlet selection; Harmony correction by sample; graph clustering
+at resolution 0.3; astrocyte subset from cluster 8; CXCL14-positive status
+based on at least one corrected RNA count.
+
+**Note:** Cluster numbers and gene-expression plots depend on software versions
+and upstream preprocessing. The identity of cluster 8 as astrocytes was
+established by inspecting established astrocyte markers in the original run.
+```
+
+```{r}
+## 1. Load public processed count matrices and assemble the starting Seurat object
+
+The six 10x count matrices are read individually to retain sample identity and genotype, then merged into the starting Seurat object. This step replaces the original in-memory lookup `get("7m_snRNAseq_combined")` and avoids a machine-specific `setwd()` path.
+
+```{r libraries-and-input}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(Matrix)
+  library(SingleCellExperiment)
+  library(celda)
+  library(scDblFinder)
+  library(harmony)
+  library(ggplot2)
+})
+
+# Expected directories: data/WT1, data/WT2, data/WT3,
+#                       data/FAD1, data/FAD2, data/FAD3.
+data_dir <- "data"
+sample_table <- data.frame(
+  folder = c("WT1", "WT2", "WT3", "FAD1", "FAD2", "FAD3"),
+  sample_id = c("WT1", "WT2", "WT3", "FAD1", "FAD2", "FAD3"),
+  condition = c(rep("WT", 3), rep("5XFAD", 3)),
+  stringsAsFactors = FALSE
+)
+
+load_sample <- function(folder_name, sample_id, condition) {
+  path <- file.path(data_dir, folder_name)
+  expected_files <- file.path(path, c("barcodes.tsv.gz", "features.tsv.gz", "matrix.mtx.gz"))
+  if (!all(file.exists(expected_files))) {
+    stop("Missing 10x matrix file(s) in ", path,
+         ". See the input folder layout above.")
+  }
+  counts <- Read10X(data.dir = path)
+  s <- CreateSeuratObject(counts = counts, project = sample_id)
+  s$sample_id <- sample_id
+  s$condition <- condition
+  s
+}
+
+sample_objects <- lapply(seq_len(nrow(sample_table)), function(i) {
+  load_sample(sample_table$folder[i], sample_table$sample_id[i],
+              sample_table$condition[i])
+})
+names(sample_objects) <- sample_table$sample_id
+
+# Match the sample order and labeling used in the original preparation.
+combined <- merge(
+  x = sample_objects[[1]],
+  y = sample_objects[-1],
+  add.cell.ids = sample_table$sample_id,
+  project = "7m_snRNAseq"
+)
+combined[["RNA"]] <- JoinLayers(combined[["RNA"]])
+
+print(table(combined$condition, combined$sample_id))
+# Optional: cache the input object locally; it is not necessary to upload it to GitHub.
+# saveRDS(combined, file = "7m_snRNAseq_combined.rds")
+
+seurat_list_raw <- SplitObject(combined, split.by = "sample_id")
+
+```
+
+```{r}
+## 2. Per-sample quality control
+
+```{r quality-control}
+# Mouse mitochondrial genes typically begin with 'mt-'.
+seurat_list_raw <- lapply(seurat_list_raw, function(s) {
+  s[["percent.mt"]] <- PercentageFeatureSet(s, pattern = "^mt-")
+  s
+})
+
+summarize_qc <- function(object_list) {
+  do.call(rbind, lapply(names(object_list), function(sid) {
+    s <- object_list[[sid]]
+    data.frame(
+      sample = sid,
+      cells = ncol(s),
+      med_nFeature = median(s$nFeature_RNA),
+      med_nCount = median(s$nCount_RNA),
+      med_mt = median(s$percent.mt)
+    )
+  }))
+}
+
+qc_pre <- summarize_qc(seurat_list_raw)
+print(qc_pre)
+
+seurat_list_qc <- lapply(seurat_list_raw, function(s) {
+  subset(s, subset =
+    nFeature_RNA >= 200 &
+    nFeature_RNA <= 7000 &
+    nCount_RNA >= 500 &
+    nCount_RNA <= 50000 &
+    percent.mt <= 15
+  )
+})
+
+qc_post <- summarize_qc(seurat_list_qc)
+print(qc_post)
+
+```
+
+```{r}
+## 3. Ambient RNA correction using decontX
+
+The `decontX` algorithm was applied separately to each QC-filtered sample,
+without an additional empty-droplet background matrix. The decontaminated
+count matrix was used downstream. Cells with an estimated contamination
+fraction greater than 0.30 were removed.
+
+```{r ambient-rna}
+seurat_list_decontx <- lapply(names(seurat_list_qc), function(sid) {
+  s <- seurat_list_qc[[sid]]
+  orig_counts <- GetAssayData(s, assay = "RNA", layer = "counts")
+  orig_per_cell <- Matrix::colSums(orig_counts)
+
+  sce <- as.SingleCellExperiment(s)
+  sce <- celda::decontX(sce)
+  decon_counts <- SummarizedExperiment::assay(sce, "decontXcounts")
+  new_per_cell <- Matrix::colSums(decon_counts)
+  frac_removed <- 1 - (new_per_cell / orig_per_cell[colnames(decon_counts)])
+
+  s2 <- CreateSeuratObject(counts = decon_counts, assay = "RNA", project = sid)
+  s2 <- AddMetaData(s2, as.data.frame(SummarizedExperiment::colData(sce)))
+  s2$sample_id <- s$sample_id[colnames(s2)]
+  s2$condition <- s$condition[colnames(s2)]
+  s2$decontX_frac_removed <- frac_removed[colnames(s2)]
+
+  # Preserve original, uncorrected counts in a separate assay at this stage.
+  s2[["RNA_raw"]] <- CreateAssayObject(
+    counts = orig_counts[, colnames(s2), drop = FALSE]
+  )
+  s2 <- subset(s2, subset = decontX_contamination <= 0.30)
+  s2
+})
+names(seurat_list_decontx) <- names(seurat_list_qc)
+
+```
+
+```{r}
+## 4. Doublet detection and singlet retention
+
+`scDblFinder` was run separately for each sample after ambient RNA correction.
+Only cells classified as singlets were retained. The rebuilt Seurat objects
+contain the decontaminated counts; the temporary `RNA_raw` assay from the
+previous step is **not** retained after this reconstruction.
+
+```{r doublet-detection}
+seurat_list_clean <- lapply(names(seurat_list_decontx), function(sid) {
+  s <- seurat_list_decontx[[sid]]
+  sce <- as.SingleCellExperiment(s, assay = "RNA")
+  sce <- scDblFinder::scDblFinder(sce)
+  sce <- sce[, sce$scDblFinder.class == "singlet"]
+
+  s2 <- CreateSeuratObject(
+    counts = SummarizedExperiment::assay(sce, "counts"),
+    project = sid
+  )
+  s2 <- AddMetaData(s2, as.data.frame(SummarizedExperiment::colData(sce)))
+  s2$sample_id <- sid
+  s2$condition <- unique(s$condition)
+  s2
+})
+names(seurat_list_clean) <- names(seurat_list_decontx)
+
+dbl_stats <- do.call(rbind, lapply(names(seurat_list_clean), function(sid) {
+  data.frame(
+    sample = sid,
+    before = ncol(seurat_list_decontx[[sid]]),
+    after = ncol(seurat_list_clean[[sid]]),
+    removed = ncol(seurat_list_decontx[[sid]]) - ncol(seurat_list_clean[[sid]])
+  )
+}))
+print(dbl_stats)
+```
+
+```{r}
+## 5. Merge samples, normalize, and perform dimensionality reduction
+
+```{r integration-and-clustering}
+merged <- merge(
+  x = seurat_list_clean[[1]],
+  y = seurat_list_clean[-1],
+  add.cell.ids = names(seurat_list_clean),
+  project = "mouse_7m_snRNA"
+)
+print(table(merged$condition, merged$sample_id))
+
+# For Seurat v5, joining sample-specific count layers may be necessary before
+# normalization.
+
+merged <- NormalizeData(merged, verbose = FALSE)
+merged <- FindVariableFeatures(merged, nfeatures = 3000, verbose = FALSE)
+vars_regress <- intersect(c("nCount_RNA", "percent.mt"), colnames(merged[[]]))
+merged <- ScaleData(merged, vars.to.regress = vars_regress, verbose = FALSE)
+merged <- RunPCA(merged, npcs = 50, verbose = FALSE)
+
+merged <- RunHarmony(
+  object = merged,
+  group.by.vars = "sample_id",
+  dims.use = 1:50
+)
+merged <- RunUMAP(merged, reduction = "harmony", dims = 1:20)
+merged <- FindNeighbors(merged, reduction = "harmony", dims = 1:20)
+merged <- FindClusters(merged, resolution = 0.3)
+
+DimPlot(merged, reduction = "umap", group.by = "seurat_clusters",
+        label = TRUE, repel = TRUE)
+FeaturePlot(merged, features = c("Gfap", "Aqp4", "Aldh1l1", "Slc1a3"),
+            raster = TRUE)
+```
+
+
+```{r}
+## 6. Select astrocytes and classify CXCL14 expression
+
+Cluster 8 was annotated as astrocytic based on the marker-expression plots in
+the original analysis. This cluster number is not a transferable cell-type
+identifier for independently rerun clustering.
+
+```{r astrocyte-subsetting}
+Idents(merged) <- "seurat_clusters"
+astro <- subset(merged, idents = "8")
+print(table(astro$condition))
+print(astro)
+
+DefaultAssay(astro) <- "RNA"
+astro[["RNA"]] <- JoinLayers(astro[["RNA"]])
+cnt <- GetAssayData(astro, assay = "RNA", layer = "counts")
+stopifnot("Cxcl14" %in% rownames(cnt))
+
+astro$Cxcl14_pos <- ifelse(
+  cnt["Cxcl14", ] > 0,
+  "Cxcl14_pos",
+  "Cxcl14_neg"
+)
+print(table(astro$Cxcl14_pos, astro$condition))
+print(table(astro$sample_id, astro$Cxcl14_pos))
+```
+
+```{r}
+## 7. Reactive astrocyte marker expression among CXCL14-positive cells
+
+#Dot size represents the percentage of cells expressing each gene. Dot color
+#represents relative average expression rescaled to 0–1 within the displayed
+#marker category; **it is not an absolute log-normalized expression value**.
+
+```#
+obj <- subset(astro, subset = Cxcl14_pos == "Cxcl14_pos")
+group_col <- "condition"
+obj@meta.data[[group_col]] <- factor(
+  obj@meta.data[[group_col]], levels = c("WT", "5XFAD")
+)
+
+genes_list <- list(
+  "Reactive astrocyte markers" = c("Gfap", "C4b", "Chil1",
+                                  "Lgals3bp", "Stat1", "Stat3")
+)
+genes_list <- lapply(genes_list, function(g) intersect(g, rownames(obj)))
+features <- unlist(genes_list, use.names = FALSE)
+
+gene2cat <- stack(genes_list) %>%
+  dplyr::rename(Gene = values, Category = ind)
+
+p <- DotPlot(obj, features = features, group.by = group_col,
+             assay = DefaultAssay(obj))
+pd <- p$data %>%
+  left_join(gene2cat, by = c("features.plot" = "Gene")) %>%
+  mutate(
+    Category = factor(Category, levels = names(genes_list)),
+    features.plot = factor(
+      features.plot,
+      levels = unlist(lapply(names(genes_list), function(ct) rev(genes_list[[ct]])))
+    )
+  )
+
+pd_facet <- pd %>%
+  group_by(Category) %>%
+  mutate(avg_exp_facet_scaled = scales::rescale(avg.exp)) %>%
+  ungroup()
+
+ggplot(pd_facet, aes(x = id, y = features.plot)) +
+  geom_point(aes(size = pct.exp, color = avg_exp_facet_scaled)) +
+  facet_grid(rows = vars(Category), scales = "free_y", space = "free_y",
+             switch = "y") +
+  scale_color_viridis_c(option = "plasma", name = "Relative average expression") +
+  scale_size(range = c(1.5, 7), name = "Percent expressed") +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 24, face = "bold"),
+    strip.background = element_rect(fill = "grey90", color = NA),
+    strip.text.y.left = element_text(size = 20, face = "bold"),
+    strip.placement = "outside",
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"),
+    axis.text.y = element_text(face = "bold", color = "black")
+  )
+```
+

@@ -1,0 +1,1510 @@
+---
+title: "Single-Nucleus RNA-seq Analysis of CXCL14 Overexpression in WT and 5xFAD Mouse
+  Hippocampus"
+output: html_document
+date: "2025-12-17"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+## 1. Import of mouse hippocampal single-nucleus RNA-seq data
+
+This section imports processed 10x Genomics gene-count matrices for 12 mouse hippocampal samples (WT, WT-CXCL14, AD, and AD-CXCL14; three samples per condition). Individual Seurat objects are created and assigned sample and sequencing-batch identifiers. An initial QC filter is applied before saving the per-sample Seurat object list. A second, more stringent QC step is performed in the downstream analysis. Raw and processes data are deposited on GEO GSE352519. Note: file names and sample IDs in directory may look slightly different and may have to be adjusted. 
+
+```{r mouse-data-import}
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+
+sample_ids <- c(
+  "109956C4", "109956C9", "109956F11", "109956F8", "109956G5", "109956G6",
+  "115478C12", "115478C4", "115478E1", "115478E10", "115478E7", "139431A6"
+)
+
+# Each directory contains the processed 10x matrix files for one sample.
+base_dir <- file.path("data", "CXCL14_snRNAseq")
+data_dirs <- setNames(file.path(base_dir, sample_ids), sample_ids)
+
+batch_map <- c(
+  "109956C4" = "25E91", "109956C9" = "25E91",
+  "109956F11" = "25E73", "109956F8" = "25E73",
+  "109956G5" = "25E73", "109956G6" = "25E73",
+  "115478C12" = "25E91", "115478C4" = "25E73",
+  "115478E1" = "25E73", "115478E10" = "25E73",
+  "115478E7" = "25E73", "139431A6" = "25E91"
+)
+
+stopifnot(setequal(sample_ids, names(batch_map)))
+missing_dirs <- data_dirs[!dir.exists(data_dirs)]
+if (length(missing_dirs)) {
+  stop("Missing sample directories: ", paste(missing_dirs, collapse = ", "))
+}
+
+objs <- list()
+for (sid in sample_ids) {
+  message("Reading sample: ", sid)
+  mat <- Read10X(data.dir = data_dirs[[sid]])
+  sobj <- CreateSeuratObject(
+    counts = mat, project = sid, min.cells = 3, min.features = 200
+  )
+  sobj$sample <- sid
+  sobj$batch <- batch_map[[sid]]
+  sobj[["percent.mt"]] <- PercentageFeatureSet(sobj, pattern = "^mt-")
+  sobj[["percent.rp"]] <- PercentageFeatureSet(sobj, pattern = "^Rp[sl]")
+  objs[[sid]] <- sobj
+}
+```
+
+```{r initial-qc}
+# Summarize per-sample quality metrics before initial filtering.
+qc_df <- do.call(rbind, lapply(objs, function(s) {
+  data.frame(
+    sample = unique(s$sample),
+    cells = ncol(s),
+    median_nFeature = median(s$nFeature_RNA),
+    median_nCount = median(s$nCount_RNA),
+    median_percent_mt = median(s$percent.mt)
+  )
+}))
+print(qc_df)
+
+# Initial QC thresholds used to create the saved starting object.
+objs <- lapply(objs, function(s) {
+  subset(s, subset =
+    nFeature_RNA >= 300 &
+    nFeature_RNA <= 8000 &
+    nCount_RNA >= 500 &
+    percent.mt <= 20
+  )
+})
+
+# Checkpoint loaded by the downstream analysis.
+saveRDS(objs, file = "snrna_raw_objs.rds")
+```
+
+
+
+## 1. Packages and sample objects
+
+```{r packages}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(ggplot2)
+  library(harmony)
+  library(celda)
+  library(SingleCellExperiment)
+  library(scDblFinder)
+  library(Matrix)
+})
+
+objs <- readRDS("snrna_raw_objs.rds")
+stopifnot(is.list(objs), length(objs) == 12L, !is.null(names(objs)))
+```
+
+## 2. Stricter QC
+
+The second QC filter retains nuclei with 300–8,000 detected genes, 500–40,000 UMIs, and ≤5% mitochondrial counts.
+
+```{r strict-qc}
+qc_summary <- do.call(rbind, lapply(names(objs), function(sid) {
+  s <- objs[[sid]]
+  data.frame(sample = sid, cells = ncol(s),
+             median_nFeature = median(s$nFeature_RNA),
+             median_nCount = median(s$nCount_RNA),
+             median_percent_mt = median(s$percent.mt))
+}))
+print(qc_summary)
+
+objs_v2 <- lapply(objs, function(s) {
+  if (!"percent.mt" %in% colnames(s[[]])) {
+    mt_pattern <- if (any(grepl("^MT-", rownames(s)))) "^MT-" else "^mt-"
+    s[["percent.mt"]] <- PercentageFeatureSet(s, pattern = mt_pattern)
+  }
+  subset(s, subset = nFeature_RNA >= 300 & nFeature_RNA <= 8000 &
+           nCount_RNA >= 500 & nCount_RNA <= 40000 & percent.mt <= 5)
+})
+merged_v2 <- merge(objs_v2[[1]], y = objs_v2[-1])
+VlnPlot(merged_v2,
+        features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+        group.by = "sample", ncol = 3, pt.size = 0)
+```
+
+## 3. Ambient RNA removal with decontX
+
+Ambient RNA was estimated per sample; nuclei with contamination estimates exceeding 0.20 were removed. Original counts were retained in a separate assay.
+
+```{r decontx}
+decontx_results_v2 <- lapply(names(objs_v2), function(sid) {
+  s <- objs_v2[[sid]]
+  orig_counts <- GetAssayData(s, assay = "RNA", layer = "counts")
+  orig_per_cell <- Matrix::colSums(orig_counts)
+
+  sce <- as.SingleCellExperiment(s)
+  sce <- celda::decontX(sce)
+  decon_counts <- SummarizedExperiment::assay(sce, "decontXcounts")
+  cont_vec <- setNames(as.numeric(sce$decontX_contamination), colnames(sce))
+  new_per_cell <- Matrix::colSums(decon_counts)
+  frac_removed <- 1 - new_per_cell / orig_per_cell[colnames(decon_counts)]
+
+  # Keep the original SCE -> Seurat conversion method used in the analysis.
+  s2 <- as.Seurat(sce, counts = "decontXcounts", data = NULL)
+  s2[["RNA_raw"]] <- CreateAssayObject(counts = orig_counts[, colnames(s2), drop = FALSE])
+  s2$decontX_contam <- cont_vec[colnames(s2)]
+  s2$decontX_frac_removed <- frac_removed[colnames(s2)]
+  s2$sample <- sid
+  s2 <- subset(s2, subset = decontX_contam <= 0.20)
+
+  list(seurat = s2,
+       per_cell = data.frame(
+         cell = colnames(s2), sample = sid,
+         decontX_contam = cont_vec[colnames(s2)],
+         decontX_frac_removed = frac_removed[colnames(s2)],
+         orig_counts = orig_per_cell[colnames(s2)],
+         new_counts = new_per_cell[colnames(s2)], row.names = NULL))
+})
+objs_v2_decontx <- setNames(lapply(decontx_results_v2, `[[`, "seurat"), names(objs_v2))
+merged_v2_decontx <- merge(objs_v2_decontx[[1]], y = objs_v2_decontx[-1])
+VlnPlot(merged_v2_decontx, features = "decontX_contam",
+        group.by = "sample", pt.size = 0) +
+  ylab("DecontX contamination fraction") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## 4. Doublet detection using scDblFinder
+
+```{r doublet-removal}
+doublet_results <- lapply(names(objs_v2_decontx), function(sid) {
+  sce <- as.SingleCellExperiment(objs_v2_decontx[[sid]])
+  sce <- scDblFinder::scDblFinder(sce)
+  calls <- table(sce$scDblFinder.class)
+  sce <- sce[, sce$scDblFinder.class == "singlet"]
+  s2 <- CreateSeuratObject(counts = SummarizedExperiment::assay(sce, "counts"), assay = "RNA")
+  s2 <- AddMetaData(s2, metadata = as.data.frame(SummarizedExperiment::colData(sce)))
+  Key(s2[["RNA"]]) <- "RNA_"
+  list(seurat = s2, calls = calls)
+})
+names(doublet_results) <- names(objs_v2_decontx)
+objs_v2_clean <- lapply(doublet_results, `[[`, "seurat")
+
+# Counts from BEFORE singlet filtering (rather than reporting zero doublets).
+dbl_stats <- do.call(rbind, lapply(names(doublet_results), function(sid) {
+  tab <- doublet_results[[sid]]$calls
+  data.frame(sample = sid,
+             singlets = if ("singlet" %in% names(tab)) unname(tab["singlet"]) else 0,
+             doublets = if ("doublet" %in% names(tab)) unname(tab["doublet"]) else 0)
+}))
+print(dbl_stats)
+```
+
+## 5. Combined analysis and Harmony integration
+
+Normalization, 3,000 highly variable genes, regression of nCount_RNA, 50 PCs, Harmony on `sample` (theta = 2), and clustering at resolution 0.2 were used in the original analysis.
+
+```{r integrated-clustering}
+merged_v2_clean <- merge(
+  objs_v2_clean[[1]], y = objs_v2_clean[-1], add.cell.ids = names(objs_v2_clean))
+DefaultAssay(merged_v2_clean) <- "RNA"
+merged_v2_clean <- NormalizeData(merged_v2_clean,
+                                normalization.method = "LogNormalize",
+                                scale.factor = 1e4, verbose = FALSE)
+merged_v2_clean <- FindVariableFeatures(merged_v2_clean,
+                                       selection.method = "vst", nfeatures = 3000,
+                                       verbose = FALSE)
+merged_v2_clean <- ScaleData(merged_v2_clean,
+                             features = VariableFeatures(merged_v2_clean),
+                             vars.to.regress = "nCount_RNA", verbose = TRUE)
+merged_v2_clean <- RunPCA(merged_v2_clean,
+                          features = VariableFeatures(merged_v2_clean), npcs = 50)
+
+# Original analysis used HarmonyMatrix on PCA embeddings. API is version-dependent.
+pca_embeddings <- Embeddings(merged_v2_clean, reduction = "pca")
+harmony_embeddings <- harmony::HarmonyMatrix(
+  data_mat = pca_embeddings,
+  meta_data = merged_v2_clean@meta.data,
+  vars_use = "sample", do_pca = FALSE, theta = 2)
+merged_v2_clean[["harmony"]] <- CreateDimReducObject(
+  embeddings = harmony_embeddings, key = "harmony_",
+  assay = DefaultAssay(merged_v2_clean))
+
+merged_v2_clean <- FindNeighbors(merged_v2_clean,
+                                reduction = "harmony", dims = 1:20, k.param = 50)
+merged_v2_clean <- FindClusters(merged_v2_clean,
+                               resolution = 0.2, algorithm = 1, random.seed = 1234)
+merged_v2_clean <- RunUMAP(merged_v2_clean,
+                          reduction = "harmony", dims = 1:20, seed.use = 1234)
+DimPlot(merged_v2_clean, group.by = "seurat_clusters", label = TRUE)
+FeaturePlot(merged_v2_clean, features = "Cx3cr1", reduction = "umap",
+            ncol = 1, pt.size = 0.1, raster = FALSE,
+            cols = c("lightgrey", "red"), min.cutoff = "q05", max.cutoff = "q95")
+```
+
+## 6. Sample metadata and broad cell-type annotations 
+
+```{r conditions-celltypes}
+group_map <- c(
+  "115478E10" = "WT", "115478C4" = "WT", "115478C12" = "WT",
+  "115478E1" = "WT-CXCL14", "115478E7" = "WT-CXCL14", "139431A6" = "WT-CXCL14",
+  "109956G5" = "AD", "109956F11" = "AD", "109956C4" = "AD",
+  "109956G6" = "AD-CXCL14", "109956F8" = "AD-CXCL14", "109956C9" = "AD-CXCL14")
+stopifnot(all(unique(merged_v2_clean$sample) %in% names(group_map)))
+merged_v2_clean$Condition <- unname(group_map[as.character(merged_v2_clean$sample)])
+print(table(merged_v2_clean$Condition, merged_v2_clean$sample))
+
+celltype_markers <- list(
+  Microglia = c("Cx3cr1", "P2ry12", "Tmem119"),
+  Oligodendrocytes = c("Mog", "Mag"), OPCs = c("Pdgfra", "Cspg4"),
+  Astrocytes = c("Aqp4", "Gfap", "Slc1a3"),
+  Excitatory = c("Slc17a7", "Camk2a"), Inhibitory = c("Gad1", "Gad2"),
+  Endothelial = c("Cldn5", "Flt1"), Pericytes = c("Pdgfrb", "Rgs5"),
+  Tcells = c("Cd3d", "Cd3e"))
+DotPlot(merged_v2_clean, features = celltype_markers,
+        group.by = "seurat_clusters") + RotatedAxis() +
+  ggtitle("Canonical marker expression by cluster") +
+  theme(strip.text = element_text(face = "bold"))
+
+Idents(merged_v2_clean) <- "seurat_clusters"
+new.cluster.ids <- c(
+  "0" = "Oligodendrocytes", "1" = "Excitatory Neurons", "2" = "Astrocytes",
+  "3" = "Excitatory Neurons", "4" = "Microglia", "5" = "OPCs",
+  "6" = "Excitatory Neurons", "7" = "Inhibitory Neurons", "8" = "Excitatory Neurons",
+  "9" = "Excitatory Neurons", "10" = "Unknown", "11" = "Unknown",
+  "12" = "Unknown", "13" = "Endothelial", "14" = "Inhibitory Neurons",
+  "15" = "Inhibitory Neurons", "16" = "Unknown", "17" = "Pericytes",
+  "18" = "Unknown", "19" = "Unknown", "20" = "Unknown",
+  "21" = "Microglia", "22" = "Unknown")
+stopifnot(all(levels(merged_v2_clean) %in% names(new.cluster.ids)))
+merged_v2_clean <- RenameIdents(merged_v2_clean, new.cluster.ids)
+merged_v2_clean$celltype <- as.character(Idents(merged_v2_clean))
+DimPlot(merged_v2_clean, reduction = "umap", group.by = "celltype",
+        label = TRUE, repel = TRUE, pt.size = 0.1, raster = FALSE) +
+  ggtitle("UMAP of Annotated Cell Types")
+```
+
+## 7. Initial microglial subclustering and contaminant exclusion
+
+```{r microglia-initial}
+microglia <- subset(merged_v2_clean, subset = celltype == "Microglia")
+DefaultAssay(microglia) <- "RNA"
+microglia <- NormalizeData(microglia, normalization.method = "LogNormalize", scale.factor = 1e4)
+microglia <- FindVariableFeatures(microglia, selection.method = "vst", nfeatures = 2000)
+microglia <- ScaleData(microglia, vars.to.regress = "nCount_RNA", verbose = FALSE)
+microglia <- RunPCA(microglia, npcs = 20, verbose = FALSE)
+
+pca_embeddings <- Embeddings(microglia, "pca")[, 1:20, drop = FALSE]
+harmony_embeddings <- harmony::HarmonyMatrix(
+  data_mat = pca_embeddings, meta_data = microglia@meta.data,
+  vars_use = "sample", do_pca = FALSE)
+microglia[["harmony"]] <- CreateDimReducObject(
+  embeddings = harmony_embeddings, key = "harmony_", assay = DefaultAssay(microglia))
+microglia <- FindNeighbors(microglia, reduction = "harmony", dims = 1:20)
+microglia <- FindClusters(microglia, resolution = 0.2)
+microglia <- RunUMAP(microglia, reduction = "harmony", dims = 1:20, seed.use = 1234)
+DimPlot(microglia, reduction = "umap", group.by = "seurat_clusters",
+        label = TRUE, repel = TRUE, pt.size = 0.1) +
+  ggtitle("Microglia Subclusters")
+
+DotPlot(microglia, features = list(
+  Homeostatic = c("Cx3cr1", "P2ry12", "Tmem119"),
+  DAM = c("Trem2", "Spp1", "Itgax", "Clec7a"),
+  Cycling = c("Mki67", "Top2a", "Ccnb1"),
+  BAMs = c("Ms4a7", "Mrc1", "Pf4", "Lyve1"),
+  Tcells = c("Cd3d", "Cd3e", "Cd8a", "Cd4"))) +
+  RotatedAxis() + ggtitle("Microglia, BAM, and T cell markers by subcluster")
+
+initial_microglia_labels <- c(
+  "0" = "Homeostatic", "1" = "DAM", "2" = "BAMs", "3" = "BAMs",
+  "4" = "Cycling", "5" = "Contamination", "6" = "T cells", "7" = "Contamination")
+stopifnot(all(levels(microglia) %in% names(initial_microglia_labels)))
+microglia <- RenameIdents(microglia, initial_microglia_labels)
+microglia$subcluster_annotation <- as.character(Idents(microglia))
+DimPlot(microglia, reduction = "umap", group.by = "subcluster_annotation",
+        label = TRUE) + ggtitle("Microglia subclusters annotated")
+```
+
+## 8. Recluster retained microglial populations 
+
+Homeostatic, DAM, and cycling populations were retained. BAMs, T cells, and contaminating populations were excluded prior to reclustering.
+
+```{r microglia-recluster}
+micro_sub <- subset(microglia, idents = c("Homeostatic", "DAM", "Cycling"))
+print(table(Idents(micro_sub)))
+micro_sub <- NormalizeData(micro_sub)
+micro_sub <- FindVariableFeatures(micro_sub)
+micro_sub <- ScaleData(micro_sub, vars.to.regress = "nCount_RNA")
+micro_sub <- RunPCA(micro_sub, npcs = 30)
+micro_sub <- RunHarmony(micro_sub, group.by.vars = "sample", dims.use = 1:20)
+micro_sub <- FindNeighbors(micro_sub, reduction = "harmony", dims = 1:20)
+micro_sub <- FindClusters(micro_sub, resolution = 0.2)
+micro_sub <- RunUMAP(micro_sub, reduction = "harmony", dims = 1:20)
+DimPlot(micro_sub, reduction = "umap", group.by = "seurat_clusters",
+        label = TRUE, repel = TRUE, pt.size = 0.1) +
+  ggtitle("Microglia Harmony clusters")
+
+# Main Figure 3B: marker expression
+FeaturePlot(micro_sub,
+            features = c("Tmem119", "Arhgap15", "Clec7a", "Itgax", "Mx1", "Mki67"),
+            reduction = "umap", ncol = 3, pt.size = 0.1, raster = FALSE)
+
+micro_sub <- JoinLayers(micro_sub)
+markers <- FindAllMarkers(micro_sub, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+top10 <- markers %>% group_by(cluster) %>% top_n(n = 10, wt = avg_log2FC)
+DoHeatmap(micro_sub, features = top10$gene) + NoLegend()
+```
+
+## 9. Final microglial subtype annotations and proportions 
+
+
+```{r microglia-final-labels}
+final_microglia_labels <- c(
+  "0" = "Homeostatic", "1" = "DAM", "2" = "Primed",
+  "3" = "Cycling", "4" = "Interferon")
+stopifnot(all(levels(micro_sub) %in% names(final_microglia_labels)))
+micro_sub$micro_subtype <- unname(final_microglia_labels[as.character(Idents(micro_sub))])
+micro_sub$micro_subtype <- factor(
+  micro_sub$micro_subtype,
+  levels = c("Homeostatic", "Primed", "DAM", "Interferon", "Cycling"))
+Idents(micro_sub) <- "micro_subtype"
+DimPlot(micro_sub, reduction = "umap", group.by = "micro_subtype",
+        label = TRUE, repel = TRUE)
+
+# Pooled cell proportions by condition, matching the original figure approach.
+df_counts <- as.data.frame(table(
+  Subtype = micro_sub$micro_subtype, Condition = micro_sub$Condition))
+df_counts$Condition <- factor(
+  df_counts$Condition, levels = c("WT", "WT-CXCL14", "AD", "AD-CXCL14"))
+ggplot(df_counts, aes(x = Condition, y = Freq, fill = Subtype)) +
+  geom_bar(stat = "identity", position = "fill") +
+  theme_classic() +
+  ylab("Proportion of microglia") +
+  ggtitle("Cell proportions per Condition by Microglia Subtype") +
+  theme(axis.text.x = element_text(size = 14, face = "bold"),
+        axis.title.x = element_text(size = 14, face = "bold"),
+        axis.title.y = element_text(size = 14, face = "bold"),
+        plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+        legend.title = element_text(size = 14, face = "bold"),
+        legend.text = element_text(size = 12, face = "bold"))
+```
+
+
+## DAM pseudobulk differential expression, GO enrichment, and module scoring
+
+This section uses the `micro_sub` Seurat object generated in the preceding analysis. Pseudobulk counts are aggregated by biological sample, with AD-CXCL14 compared against AD.
+
+```{r dam-pseudobulk-setup}
+library(Seurat)
+library(DESeq2)
+library(Matrix)
+library(dplyr)
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(AnnotationDbi)
+library(GO.db)
+library(ggplot2)
+library(stringr)
+
+# Restrict to the previously annotated disease-associated microglia (DAM).
+dam_only <- subset(micro_sub, subset = micro_subtype == "DAM")
+
+# Aggregate raw counts per biological replicate. Since each sample belongs
+# to only one condition, group by sample and reconstruct condition from the
+# original per-cell metadata rather than parsing Seurat column names.
+pseudo_dam <- AggregateExpression(
+  dam_only, assays = "RNA", return.seurat = TRUE,
+  group.by = "sample"
+)
+
+# With return.seurat=TRUE, the RNA counts represent summed pseudobulk counts.
+dam_counts <- GetAssayData(pseudo_dam, assay = "RNA", layer = "counts")
+
+sample_metadata <- unique(dam_only@meta.data[, c("sample", "Condition")])
+stopifnot(!anyDuplicated(sample_metadata$sample))
+stopifnot(all(colnames(dam_counts) %in% sample_metadata$sample))
+
+dam_coldata <- sample_metadata[match(colnames(dam_counts), sample_metadata$sample), , drop = FALSE]
+rownames(dam_coldata) <- dam_coldata$sample
+stopifnot(identical(rownames(dam_coldata), colnames(dam_counts)))
+
+# Select the two experimental groups for this comparison.
+keep_samples <- dam_coldata$Condition %in% c("AD", "AD-CXCL14")
+dam_counts <- dam_counts[, keep_samples, drop = FALSE]
+dam_coldata <- dam_coldata[keep_samples, , drop = FALSE]
+dam_coldata$Condition <- factor(dam_coldata$Condition, levels = c("AD", "AD-CXCL14"))
+stopifnot(!anyNA(dam_coldata$Condition))
+print(table(dam_coldata$Condition))
+```
+
+### DAM pseudobulk differential expression (original ≥200-count filter)
+
+```{r dam-pseudobulk-de}
+# Preserve the original total-count filtering and gene exclusions.
+dam_counts_de <- dam_counts[rowSums(dam_counts) >= 200, , drop = FALSE]
+exclude_gene <- grepl("^Gm", rownames(dam_counts_de)) |
+  grepl("Rik$", rownames(dam_counts_de)) |
+  grepl("^Mt-", rownames(dam_counts_de)) |
+  grepl("^Rp[sl]", rownames(dam_counts_de))
+dam_counts_de <- dam_counts_de[!exclude_gene, , drop = FALSE]
+cat("Genes before filtering:", nrow(dam_counts), "\n")
+cat("Genes retained for DE export:", nrow(dam_counts_de), "\n")
+
+dds_dam_de <- DESeqDataSetFromMatrix(
+  countData = round(as.matrix(dam_counts_de)),
+  colData = dam_coldata,
+  design = ~ Condition
+)
+dds_dam_de <- DESeq(dds_dam_de)
+res_dam_de <- results(dds_dam_de, contrast = c("Condition", "AD-CXCL14", "AD"))
+df_dam_de <- as.data.frame(res_dam_de)
+df_dam_de$gene <- rownames(df_dam_de)
+head(df_dam_de)
+# Optional export; uncomment after selecting an output directory.
+# write.csv(df_dam_de, "DAMonly_v2_df_ADcx_AD.csv", row.names = FALSE)
+```
+
+### GO Biological Process GSEA (≥10-count filter)
+
+```{r dam-go-gsea}
+
+dam_counts_go <- dam_counts[rowSums(dam_counts) >= 10, , drop = FALSE]
+dds_dam_go <- DESeqDataSetFromMatrix(
+  countData = round(as.matrix(dam_counts_go)),
+  colData = dam_coldata,
+  design = ~ Condition
+)
+dds_dam_go <- DESeq(dds_dam_go)
+res_dam_go <- results(dds_dam_go, contrast = c("Condition", "AD-CXCL14", "AD"))
+df_go <- as.data.frame(res_dam_go)
+df_go$gene <- rownames(df_go)
+
+# The original analysis used SYMBOL -> ENTREZID annotation and retained the
+# first mapping per ENTREZID. Keep that behavior for comparison with the paper.
+gene2entrez <- AnnotationDbi::select(
+  org.Mm.eg.db, keys = unique(df_go$gene),
+  keytype = "SYMBOL", columns = "ENTREZID"
+)
+df_go <- dplyr::left_join(df_go, gene2entrez, by = c("gene" = "SYMBOL"))
+df_go <- df_go[!is.na(df_go$ENTREZID), , drop = FALSE]
+df_go <- df_go[!duplicated(df_go$ENTREZID), , drop = FALSE]
+ranks_dam_go <- df_go$stat
+names(ranks_dam_go) <- df_go$ENTREZID
+ranks_dam_go <- sort(ranks_dam_go[is.finite(ranks_dam_go)], decreasing = TRUE)
+
+gsea_dam_go <- gseGO(
+  geneList = ranks_dam_go,
+  OrgDb = org.Mm.eg.db,
+  keyType = "ENTREZID", ont = "BP",
+  pvalueCutoff = 0.05,
+  verbose = FALSE
+)
+
+# Original final plot excludes the GO descendants of translation and
+# ribosome assembly before redundancy pruning.
+translation_family <- unique(c("GO:0006412", GO.db::GOBPOFFSPRING[["GO:0006412"]]))
+ribosome_family <- unique(c("GO:0042255", GO.db::GOBPOFFSPRING[["GO:0042255"]]))
+drop_ids <- unique(c(translation_family, ribosome_family))
+gsea_dam_go@result <- gsea_dam_go@result[
+  !gsea_dam_go@result$ID %in% drop_ids, , drop = FALSE
+]
+
+# Retain original similarity and simplification settings.
+gsea_dam_go <- enrichplot::pairwise_termsim(gsea_dam_go)
+gsea_dam_go_slim <- clusterProfiler::simplify(
+  gsea_dam_go, cutoff = 0.7, by = "p.adjust", select_fun = min
+)
+gsea_dam_go_slim <- clusterProfiler::setReadable(
+  gsea_dam_go_slim, OrgDb = org.Mm.eg.db, keyType = "ENTREZID"
+)
+gsea_dam_go_df <- as.data.frame(gsea_dam_go_slim)
+
+top_go_up <- gsea_dam_go_df %>%
+  filter(!is.na(NES), NES > 0) %>%
+  slice_max(order_by = NES, n = 7)
+
+plot_df <- top_go_up %>%
+  mutate(
+    neglog10padj = -log10(p.adjust),
+    Description = stringr::str_to_sentence(Description),
+    Description = gsub("type ii", "type II", Description, ignore.case = TRUE)
+  ) %>%
+  arrange(NES) %>%
+  mutate(Description = factor(Description, levels = Description))
+
+ggplot(plot_df, aes(x = NES, y = Description, fill = neglog10padj)) +
+  geom_col(width = 0.8) +
+  scale_fill_viridis_c(option = "viridis", name = expression(-log[10]("adjusted p-value"))) +
+  labs(x = "NES", y = NULL) +
+  theme_classic(base_size = 14) +
+  theme(axis.text.y = element_text(size = 20, face = "bold", color = "black"))
+```
+
+### DAM1, DAM2, and combined DAM expression scores
+
+The scores below are **mean log-normalized expression values**, not Seurat `AddModuleScore` values. Scores are computed per cell and then averaged by biological sample and condition.
+
+```{r dam-module-scores}
+# Keren-Shaul et al., Cell (2017), PMID: 28602351.
+dam1_genes <- c("Tyrobp", "Ctsd", "Ctsb", "Apoe", "B2m", "Fth1", "Lyz2")
+dam2_genes <- c("Trem2", "Axl", "Cst7", "Lpl", "Cd9", "Csf1", "Ccl6", "Itgax", "Clec7a", "Lilrb4a")
+dam_combined_genes <- unique(c(dam1_genes, dam2_genes))
+
+# The normalized expression layer should have been populated during the
+# preceding microglia analysis; join layers as needed for Seurat v5.
+DefaultAssay(dam_only) <- "RNA"
+expr_mat <- GetAssayData(dam_only, assay = "RNA", layer = "data")
+
+mean_signature <- function(genes) {
+  present <- intersect(genes, rownames(expr_mat))
+  if (!length(present)) stop("No genes found for signature")
+  missing <- setdiff(genes, present)
+  if (length(missing)) message("Missing signature genes: ", paste(missing, collapse = ", "))
+  Matrix::colMeans(expr_mat[present, , drop = FALSE])
+}
+
+dam_only$DAM1_avgexp <- mean_signature(dam1_genes)
+dam_only$DAM2_avgexp <- mean_signature(dam2_genes)
+dam_only$DAM_combined_avgexp <- mean_signature(dam_combined_genes)
+
+avg_scores <- dam_only@meta.data %>%
+  group_by(sample, Condition) %>%
+  summarise(
+    DAM1score = mean(DAM1_avgexp, na.rm = TRUE),
+    DAM2score = mean(DAM2_avgexp, na.rm = TRUE),
+    DAM_combined_score = mean(DAM_combined_avgexp, na.rm = TRUE),
+    .groups = "drop"
+  )
+print(avg_scores)
+```
+
+
+```{r}
+
+## DAM pseudobulk heatmap: AD versus AD-CXCL14
+# Heatmap of DAM1 and DAM2 signature genes using normalized
+# pseudobulk counts, log2 transformation, and row-wise Z-scores.
+# Samples are ordered AD first, followed by AD-CXCL14.
+
+library(pheatmap)
+
+# DAM signatures (Keren-Shaul et al., 2017)
+dam1_genes <- c(
+  "Tyrobp", "Ctsd", "Ctsb", "Apoe", "B2m", "Fth1", "Lyz2"
+)
+
+dam2_genes <- c(
+  "Trem2", "Axl", "Cst7", "Lpl", "Cd9",
+  "Csf1", "Ccl6", "Itgax", "Clec7a", "Lilrb4a"
+)
+
+# Use the DAM pseudobulk DESeq2 object from the preceding analysis.
+# This must correspond to AD vs AD-CXCL14 biological samples.
+dds_heatmap <- dds_dam_go
+
+# Select available DAM signature genes
+dam_genes <- c(dam1_genes, dam2_genes)
+dam_genes <- dam_genes[dam_genes %in% rownames(dds_heatmap)]
+
+# Extract normalized pseudobulk expression
+norm_counts <- DESeq2::counts(dds_heatmap, normalized = TRUE)
+mat <- norm_counts[dam_genes, , drop = FALSE]
+
+# Align sample metadata with the expression matrix
+coldata <- as.data.frame(SummarizedExperiment::colData(dds_heatmap))
+coldata <- coldata[colnames(mat), , drop = FALSE]
+
+# Explicitly set condition order
+coldata$Condition <- factor(
+  coldata$Condition,
+  levels = c("AD", "AD-CXCL14")
+)
+
+# Confirm that all samples belong to the two expected conditions
+stopifnot(!anyNA(coldata$Condition))
+
+# Order samples: AD first, then AD-CXCL14
+ord <- order(coldata$Condition, coldata$sample)
+mat <- mat[, ord, drop = FALSE]
+coldata <- coldata[ord, , drop = FALSE]
+
+# Column annotations
+ann <- data.frame(Condition = coldata$Condition)
+rownames(ann) <- colnames(mat)
+
+ann_colors <- list(
+  Condition = c(
+    "AD" = "#F8766D",
+    "AD-CXCL14" = "#00BFC4"
+  )
+)
+
+# Generate heatmap
+pheatmap::pheatmap(
+  log2(mat + 1),
+  annotation_col = ann,
+  annotation_colors = ann_colors,
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  scale = "row",
+  gaps_col = sum(ann$Condition == "AD"),
+  show_rownames = TRUE,
+  show_colnames = TRUE,
+  fontsize_row = 18,
+  fontsize_col = 10,
+  border_color = NA,
+  main = "DAM signature expression in AD and AD-CXCL14 microglia"
+)
+
+```
+
+
+```{r}
+
+## Percentage of DAM cells expressing selected DAM-associated genes
+# Compare AD and AD-CXCL14 microglia.
+# Each point represents an individual biological sample.
+
+library(dplyr)
+library(ggplot2)
+library(Seurat)
+
+# 1. Select DAM cells from AD and AD-CXCL14 mice
+dam_ad <- subset(
+  dam_only,
+  subset = Condition %in% c("AD", "AD-CXCL14")
+)
+
+# 2. Define DAM-associated marker genes
+dam1_genes <- c(
+  "Tyrobp", "Ctsd", "Ctsb", "Apoe", "B2m", "Fth1", "Lyz2"
+)
+
+dam2_genes <- c(
+  "Trem2", "Axl", "Cst7", "Lpl", "Cd9",
+  "Csf1", "Ccl6", "Itgax", "Clec7a", "Lilrb4a"
+)
+
+genes <- c(dam1_genes, dam2_genes, "Spp1")
+
+# 3. Extract log-normalized expression
+expr_mat <- GetAssayData(dam_ad, assay = "RNA", layer = "data")
+
+# Retain genes present in the dataset
+available_genes <- genes[genes %in% rownames(expr_mat)]
+missing_genes <- setdiff(genes, available_genes)
+
+if (length(missing_genes) > 0) {
+  message("Genes not found: ", paste(missing_genes, collapse = ", "))
+}
+
+# 4. Calculate percent-positive cells per biological sample
+# Original criterion: log-normalized expression > 1
+threshold <- 1
+
+frac_by_gene <- lapply(available_genes, function(g) {
+
+  gene_positive <- expr_mat[g, ] > threshold
+
+  cell_data <- dam_ad@meta.data %>%
+    mutate(gene_positive = as.logical(
+      gene_positive[rownames(dam_ad@meta.data)]
+    ))
+
+  cell_data %>%
+    group_by(sample, Condition) %>%
+    summarise(
+      gene = g,
+      percent_positive = mean(gene_positive) * 100,
+      .groups = "drop"
+    )
+
+}) %>%
+  bind_rows()
+
+# 5. Calculate mean percent-positive cells by condition
+avg_frac <- frac_by_gene %>%
+  group_by(gene, Condition) %>%
+  summarise(
+    mean_percent = mean(percent_positive),
+    .groups = "drop"
+  )
+
+# 6. Set plotting order
+frac_by_gene$gene <- factor(
+  frac_by_gene$gene,
+  levels = available_genes
+)
+
+avg_frac$gene <- factor(
+  avg_frac$gene,
+  levels = available_genes
+)
+
+frac_by_gene$Condition <- factor(
+  frac_by_gene$Condition,
+  levels = c("AD", "AD-CXCL14")
+)
+
+avg_frac$Condition <- factor(
+  avg_frac$Condition,
+  levels = c("AD", "AD-CXCL14")
+)
+
+# 7. Plot percentage-positive DAM cells
+ggplot() +
+  geom_col(
+    data = avg_frac,
+    aes(x = gene, y = mean_percent, fill = Condition),
+    position = position_dodge(width = 0.8),
+    width = 0.7,
+    alpha = 0.7
+  ) +
+  geom_point(
+    data = frac_by_gene,
+    aes(
+      x = gene,
+      y = percent_positive,
+      color = Condition,
+      group = Condition
+    ),
+    position = position_jitterdodge(
+      jitter.width = 0.2,
+      dodge.width = 0.8,
+      seed = 1234
+    ),
+    size = 2
+  ) +
+  scale_y_continuous(
+    limits = c(0, 100),
+    name = "DAM cells expressing gene (%)"
+  ) +
+  labs(
+    x = "Gene",
+    fill = "Condition",
+    color = "Condition"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1
+    ),
+    axis.text.y = element_text(color = "black"),
+    axis.title = element_text(face = "bold")
+  )
+
+```
+
+## WT versus WT-CXCL14 microglia: pseudobulk DESeq2 and Reactome GSEA
+
+
+```{r wt-microglia-pseudobulk}
+library(Seurat)
+library(DESeq2)
+library(dplyr)
+library(AnnotationDbi)
+library(org.Mm.eg.db)
+library(ReactomePA)
+library(ggplot2)
+library(stringr)
+
+# 1. Select WT and WT-CXCL14 microglia (all retained microglial states).
+wt_micro <- subset(micro_sub, subset = Condition %in% c("WT", "WT-CXCL14"))
+stopifnot(all(c("sample", "Condition") %in% colnames(wt_micro[[]])))
+
+# 2. Confirm one condition per biological sample.
+sample_info <- unique(wt_micro[[]][, c("sample", "Condition")])
+if (anyDuplicated(sample_info$sample)) {
+  stop("One or more sample IDs map to multiple conditions.")
+}
+stopifnot(all(sample_info$Condition %in% c("WT", "WT-CXCL14")))
+
+# 3. Sum raw RNA counts per sample; do not aggregate by condition.
+# AggregateExpression uses the raw RNA counts by default.
+wt_counts <- AggregateExpression(
+  wt_micro,
+  assays = "RNA",
+  group.by = "sample",
+  return.seurat = FALSE,
+  verbose = FALSE
+)$RNA
+
+# 4. Align metadata by explicit sample names (no parsing of column names).
+wt_coldata <- sample_info[match(colnames(wt_counts), sample_info$sample), , drop = FALSE]
+rownames(wt_coldata) <- wt_coldata$sample
+stopifnot(!anyNA(wt_coldata$sample), identical(rownames(wt_coldata), colnames(wt_counts)))
+wt_coldata$Condition <- factor(wt_coldata$Condition, levels = c("WT", "WT-CXCL14"))
+print(table(wt_coldata$Condition))
+
+# 5. Fit a dedicated DESeq2 model for this comparison.
+# REVIEW: confirm the count-filtering threshold used for the final figure.
+wt_counts <- wt_counts[rowSums(wt_counts) >= 10, , drop = FALSE]
+dds_wt_microglia <- DESeqDataSetFromMatrix(
+  countData = round(as.matrix(wt_counts)),
+  colData = wt_coldata,
+  design = ~ Condition
+)
+dds_wt_microglia <- DESeq(dds_wt_microglia)
+res_WTcx_WT <- results(
+  dds_wt_microglia,
+  contrast = c("Condition", "WT-CXCL14", "WT")
+)
+summary(res_WTcx_WT)
+```
+
+```{r wt-microglia-reactome}
+# 6. Map mouse SYMBOL identifiers to ENTREZ IDs and rank by DESeq2 Wald statistic.
+res4 <- as.data.frame(res_WTcx_WT)
+res4 <- res4[!is.na(res4$stat), , drop = FALSE]
+res4$gene <- rownames(res4)
+
+gene2entrez_list4 <- AnnotationDbi::select(
+  org.Mm.eg.db,
+  keys = unique(res4$gene),
+  keytype = "SYMBOL",
+  columns = "ENTREZID"
+)
+
+df_list4 <- dplyr::left_join(res4, gene2entrez_list4,
+                             by = c("gene" = "SYMBOL"))
+df_list4 <- df_list4[!is.na(df_list4$ENTREZID), , drop = FALSE]
+# Preserve the original analysis's first-occurrence rule for duplicate IDs.
+df_list4 <- df_list4[!duplicated(df_list4$ENTREZID), , drop = FALSE]
+
+ranks_list4 <- df_list4$stat
+names(ranks_list4) <- df_list4$ENTREZID
+ranks_list4 <- sort(ranks_list4[is.finite(ranks_list4)], decreasing = TRUE)
+stopifnot(!anyDuplicated(names(ranks_list4)))
+
+# 7. Reactome GSEA.
+gsea_reactome_list4 <- ReactomePA::gsePathway(
+  geneList = ranks_list4,
+  organism = "mouse",
+  pvalueCutoff = 0.05,
+  verbose = FALSE
+)
+
+gsea_reactome_list4_df <- as.data.frame(gsea_reactome_list4) %>%
+  group_by(Description) %>%
+  slice_min(order_by = p.adjust, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+# Exclude translation/ribosomal pathway descriptions, as in the original code.
+gsea_reactome_list4_df <- gsea_reactome_list4_df %>%
+  filter(!grepl("40S|43S|ternary|translation|ribosom|rRNA",
+                Description, ignore.case = TRUE))
+
+# 8. Remove highly overlapping pathways by leading-edge Jaccard similarity.
+# Preserve the original >0.4 cutoff and p.adjust preference.
+gsea_reactome_list4_df$core_genes_entrez <- strsplit(
+  as.character(gsea_reactome_list4_df$core_enrichment), "/"
+)
+
+jaccard <- function(a, b) {
+  union_genes <- union(a, b)
+  if (length(union_genes) == 0) return(0)
+  length(intersect(a, b)) / length(union_genes)
+}
+
+sets <- gsea_reactome_list4_df$core_genes_entrez
+keep_pathway <- rep(TRUE, length(sets))
+
+for (i in seq_along(sets)) {
+  if (!keep_pathway[i]) next
+  for (j in seq_along(sets)) {
+    if (i < j && keep_pathway[j] && jaccard(sets[[i]], sets[[j]]) > 0.4) {
+      if (gsea_reactome_list4_df$p.adjust[i] <= gsea_reactome_list4_df$p.adjust[j]) {
+        keep_pathway[j] <- FALSE
+      } else {
+        keep_pathway[i] <- FALSE
+      }
+    }
+  }
+}
+
+gsea_reactome_list4_df_filtered <- gsea_reactome_list4_df[keep_pathway, , drop = FALSE]
+
+# 9. Annotate leading-edge genes with symbols.
+all_entrez <- unique(unlist(strsplit(
+  as.character(gsea_reactome_list4_df_filtered$core_enrichment), "/"
+)))
+entrez2symbol <- AnnotationDbi::mapIds(
+  org.Mm.eg.db,
+  keys = all_entrez,
+  keytype = "ENTREZID",
+  column = "SYMBOL",
+  multiVals = "first"
+)
+
+gsea_reactome_list4_df_filtered$leading_edge_symbols <- vapply(
+  gsea_reactome_list4_df_filtered$core_enrichment,
+  function(x) {
+    syms <- entrez2symbol[strsplit(x, "/")[[1]]]
+    paste(stats::na.omit(syms), collapse = ", ")
+  },
+  character(1)
+)
+```
+
+```{r wt-microglia-reactome-plot}
+# 10. Plot top 10 positively enriched Reactome pathways.
+# These are selected by NES
+top_reactome_up <- gsea_reactome_list4_df_filtered %>%
+  filter(!is.na(NES), NES > 0) %>%
+  slice_max(order_by = NES, n = 10, with_ties = FALSE)
+
+plot_df <- top_reactome_up %>%
+  mutate(
+    neglog10padj = -log10(p.adjust),
+    Description = stringr::str_to_sentence(Description),
+    Description = gsub("nmda", "NMDA", Description, ignore.case = TRUE),
+    Description = gsub("igfbps", "IGFBPs", Description, ignore.case = TRUE),
+    Description = gsub("igf", "IGF", Description, ignore.case = TRUE),
+    Description = gsub("hs-gag", "HS-GAG", Description, ignore.case = TRUE),
+    Description = gsub("ca\\+\\+", "Ca²⁺", Description, perl = TRUE),
+    Description = gsub(
+      "Regulation of insulin-like growth factor \\(IGF\\) transport and uptake by insulin-like growth factor binding proteins \\(IGFBPs\\)",
+      "Regulation of IGF transport and uptake by IGFBPs",
+      Description
+    )
+  ) %>%
+  arrange(NES) %>%
+  mutate(Description = factor(Description, levels = Description))
+
+ggplot(plot_df, aes(x = NES, y = Description, fill = neglog10padj)) +
+  geom_col(width = 0.8) +
+  scale_fill_viridis_c(
+    option = "viridis",
+    name = expression(-log[10]("adjusted p-value"))
+  ) +
+  labs(x = "NES", y = NULL) +
+  theme_classic(base_size = 14) +
+  theme(axis.text.y = element_text(size = 20, face = "bold", color = "black"))
+```
+
+
+
+## IFN microglia: AD-CXCL14 versus AD pseudobulk and GO enrichment
+
+This section analyzes interferon-response microglia from AD and AD-CXCL14 animals.
+Counts are aggregated at the biological-sample level before DESeq2. GO Biological
+Process enrichment uses Wald statistics ranked by Entrez gene ID. Pathways are
+simplified by GO semantic similarity and then by leading-edge gene overlap.
+
+```{r ifn-pseudobulk}
+library(Seurat)
+library(DESeq2)
+library(dplyr)
+library(Matrix)
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(AnnotationDbi)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+
+# Retain only IFN-response microglia from the two AD genotypes.
+micro_ifn_ad <- subset(
+  micro_sub,
+  subset = micro_subtype == "Interferon" &
+    Condition %in% c("AD", "AD-CXCL14")
+)
+DefaultAssay(micro_ifn_ad) <- "RNA"
+
+# This analysis uses raw, unnormalized RNA counts (not Harmony embeddings).
+# Join sample-specific Seurat v5 layers when necessary.
+if (inherits(micro_ifn_ad[["RNA"]], "Assay5")) {
+  micro_ifn_ad <- JoinLayers(micro_ifn_ad, assay = "RNA")
+}
+counts_ifn <- Seurat::GetAssayData(micro_ifn_ad, assay = "RNA", layer = "counts")
+meta_ifn <- micro_ifn_ad[[]]
+stopifnot(identical(colnames(counts_ifn), rownames(meta_ifn)))
+stopifnot(!anyNA(meta_ifn$sample), !anyNA(meta_ifn$Condition))
+
+# Validate one genotype assignment for each biological sample.
+sample_meta_ifn <- unique(meta_ifn[, c("sample", "Condition")])
+stopifnot(!anyDuplicated(sample_meta_ifn$sample))
+print(table(sample_meta_ifn$Condition))
+
+# Pseudobulk sum by sample. Avoid converting the full sparse matrix to dense.
+cell_indices <- split(seq_len(ncol(counts_ifn)), meta_ifn$sample)
+pb_ifn <- do.call(cbind, lapply(cell_indices, function(idx) {
+  Matrix::rowSums(counts_ifn[, idx, drop = FALSE])
+}))
+colnames(pb_ifn) <- names(cell_indices)
+
+coldata_ifn <- sample_meta_ifn[
+  match(colnames(pb_ifn), sample_meta_ifn$sample), , drop = FALSE
+]
+rownames(coldata_ifn) <- coldata_ifn$sample
+stopifnot(identical(colnames(pb_ifn), rownames(coldata_ifn)))
+coldata_ifn$Condition <- factor(
+  coldata_ifn$Condition, levels = c("AD", "AD-CXCL14")
+)
+stopifnot(all(table(coldata_ifn$Condition) >= 2))
+
+# Preserve the original filtering rule: >=10 counts in >=3 samples.
+dds_ifn <- DESeq2::DESeqDataSetFromMatrix(
+  countData = round(pb_ifn),
+  colData = coldata_ifn,
+  design = ~ Condition
+)
+keep_ifn <- rowSums(DESeq2::counts(dds_ifn) >= 10) >= 3
+dds_ifn <- dds_ifn[keep_ifn, ]
+dds_ifn <- DESeq2::DESeq(dds_ifn)
+res_ifn <- DESeq2::results(
+  dds_ifn, contrast = c("Condition", "AD-CXCL14", "AD")
+)
+res_ifn_df <- as.data.frame(res_ifn)
+res_ifn_df$gene <- rownames(res_ifn_df)
+summary(res_ifn)
+```
+
+## GO Biological Process GSEA
+
+```{r ifn-go-gsea}
+# Original input gene identifiers were mouse gene symbols.
+res_ifn_clean <- res_ifn_df %>%
+  filter(!is.na(stat), is.finite(stat))
+
+# Map symbols to Entrez IDs; retain one entry per Entrez identifier.
+
+gene_map_ifn <- AnnotationDbi::select(
+  org.Mm.eg.db,
+  keys = unique(res_ifn_clean$gene),
+  keytype = "SYMBOL",
+  columns = "ENTREZID"
+) %>%
+  filter(!is.na(ENTREZID)) %>%
+  distinct(SYMBOL, ENTREZID)
+
+res_ifn_mapped <- res_ifn_clean %>%
+  inner_join(gene_map_ifn, by = c("gene" = "SYMBOL")) %>%
+  arrange(desc(abs(stat)), gene) %>%
+  distinct(ENTREZID, .keep_all = TRUE)
+
+ranked_stats_ifn <- res_ifn_mapped$stat
+names(ranked_stats_ifn) <- res_ifn_mapped$ENTREZID
+ranked_stats_ifn <- sort(ranked_stats_ifn, decreasing = TRUE)
+stopifnot(!anyDuplicated(names(ranked_stats_ifn)))
+
+set.seed(1)
+ego_bp_ifn <- clusterProfiler::gseGO(
+  geneList = ranked_stats_ifn,
+  OrgDb = org.Mm.eg.db,
+  ont = "BP",
+  keyType = "ENTREZID",
+  minGSSize = 10,
+  maxGSSize = 500,
+  pvalueCutoff = 1
+)
+
+# Optional annotated leading-edge table for inspecting the results.
+gsea_ifn_results <- as.data.frame(ego_bp_ifn)
+if (nrow(gsea_ifn_results) > 0) {
+  core_ifn_long <- gsea_ifn_results %>%
+    filter(!is.na(core_enrichment), nzchar(core_enrichment)) %>%
+    mutate(ENTREZID = strsplit(core_enrichment, "/")) %>%
+    tidyr::unnest(ENTREZID)
+
+  entrez_symbol_map <- AnnotationDbi::mapIds(
+    org.Mm.eg.db,
+    keys = unique(core_ifn_long$ENTREZID),
+    column = "SYMBOL",
+    keytype = "ENTREZID",
+    multiVals = "first"
+  )
+  core_ifn_summary <- core_ifn_long %>%
+    mutate(SYMBOL = unname(entrez_symbol_map[ENTREZID])) %>%
+    group_by(ID, Description, NES, p.adjust, qvalue) %>%
+    summarise(
+      core_genes_SYMBOL = paste(sort(unique(na.omit(SYMBOL))), collapse = ", "),
+      core_genes_ENTREZ = paste(sort(unique(ENTREZID)), collapse = ", "),
+      .groups = "drop"
+    )
+  print(head(core_ifn_summary, 10))
+}
+
+# Remove redundant GO terms using Wang semantic similarity.
+ego_bp_ifn_simpl <- clusterProfiler::simplify(
+  ego_bp_ifn,
+  cutoff = 0.7,
+  by = "p.adjust",
+  select_fun = min,
+  measure = "Wang"
+)
+res_ifn_simpl <- as.data.frame(ego_bp_ifn_simpl)
+```
+
+## Prune overlapping pathways and plot enriched biological processes
+
+```{r ifn-go-pathway-plots}
+# Original selection: 50 largest positive NES and 50 smallest negative NES.
+res_ifn_up50 <- res_ifn_simpl %>%
+  filter(!is.na(NES), NES > 0) %>%
+  arrange(desc(NES)) %>%
+  slice_head(n = 50)
+res_ifn_down50 <- res_ifn_simpl %>%
+  filter(!is.na(NES), NES < 0) %>%
+  arrange(NES) %>%
+  slice_head(n = 50)
+
+jaccard_ifn <- function(a, b) {
+  n_union <- length(union(a, b))
+  if (n_union == 0) return(0)
+  length(intersect(a, b)) / n_union
+}
+
+# Preserve original sequential pairwise pruning threshold (>0.5).
+prune_by_jaccard_ifn <- function(df, cutoff = 0.5) {
+  df <- df %>% filter(!is.na(core_enrichment))
+  sets <- strsplit(as.character(df$core_enrichment), "/")
+  keep <- rep(TRUE, length(sets))
+  if (length(sets) < 2) return(df)
+  for (i in seq_along(sets)) {
+    if (!keep[i]) next
+    for (j in seq_along(sets)) {
+      if (i < j && keep[j] && jaccard_ifn(sets[[i]], sets[[j]]) > cutoff) {
+        if (df$p.adjust[i] <= df$p.adjust[j]) {
+          keep[j] <- FALSE
+        } else {
+          keep[i] <- FALSE
+        }
+      }
+    }
+  }
+  df[keep, , drop = FALSE]
+}
+
+res_ifn_up_pruned <- prune_by_jaccard_ifn(res_ifn_up50, 0.5)
+res_ifn_down_pruned <- prune_by_jaccard_ifn(res_ifn_down50, 0.5)
+
+# Display names only; original p-values/NES are unchanged.
+format_go_label_ifn <- function(x) {
+  x <- stringr::str_to_sentence(x)
+  x <- gsub("type ii", "type II", x, ignore.case = TRUE)
+  x <- gsub("\\bb cell\\b", "B cell", x, ignore.case = TRUE)
+  x <- gsub("^Erad", "ERAD", x, ignore.case = TRUE)
+  x <- gsub("^Er-", "ER–", x, ignore.case = TRUE)
+  x <- gsub("er nucleus", "ER–nucleus", x, ignore.case = TRUE)
+  x <- gsub("^Dna", "DNA", x)
+  x <- gsub("Interferon-alpha", "Interferon-α", x)
+  x
+}
+
+# Upregulated: top 10 by largest positive NES.
+plot_ifn_up <- res_ifn_up_pruned %>%
+  filter(!is.na(NES), NES > 0) %>%
+  slice_max(order_by = NES, n = 10, with_ties = FALSE) %>%
+  mutate(
+    neglog10p = -log10(pvalue),
+    Description = format_go_label_ifn(Description)
+  ) %>%
+  arrange(NES) %>%
+  mutate(Description = factor(Description, levels = Description))
+
+p_ifn_go_up <- ggplot(plot_ifn_up, aes(x = NES, y = Description, fill = neglog10p)) +
+  geom_col(width = 0.8) +
+  scale_fill_viridis_c(option = "viridis", name = expression(-log[10]("p-value"))) +
+  labs(x = "NES", y = NULL) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.text.y = element_text(size = 14, face = "bold", color = "black"),
+    axis.text.x = element_text(size = 12, face = "bold")
+  )
+print(p_ifn_go_up)
+
+# Downregulated: top 10 by most negative NES.
+plot_ifn_down <- res_ifn_down_pruned %>%
+  filter(!is.na(NES), NES < 0) %>%
+  slice_min(order_by = NES, n = 10, with_ties = FALSE) %>%
+  mutate(
+    neglog10p = -log10(pvalue),
+    Description = format_go_label_ifn(Description)
+  ) %>%
+  arrange(desc(NES)) %>%
+  mutate(Description = factor(Description, levels = Description))
+
+p_ifn_go_down <- ggplot(plot_ifn_down, aes(x = NES, y = Description, fill = neglog10p)) +
+  geom_col(width = 0.8) +
+  scale_fill_viridis_c(option = "viridis", name = expression(-log[10]("p-value"))) +
+  labs(x = "NES", y = NULL) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.text.y = element_text(size = 20, face = "bold", color = "black"),
+    axis.text.x = element_text(size = 12, face = "bold")
+  )
+print(p_ifn_go_down)
+```
+
+
+## IFN-response microglia: signature heatmap and expression scores
+
+The following analyses use a 13-gene type I interferon (IFN) signature. The heatmap shows mean expression per biological sample among IFN-response microglia from AD and AD-CXCL14 mice. The expression score is the per-cell mean of log-normalized expression across the same genes, subsequently averaged by biological sample. This is not Seurat's `AddModuleScore()` method.
+
+```{r ifn-signature-setup}
+# Packages used in this section
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(Matrix)
+library(pheatmap)
+
+# Gene signature used in both analyses
+ifn_genes <- c(
+  "Stat1", "Stat2", "Irf7",
+  "Mx1", "Isg15", "Ifit1", "Ifit3", "Oasl2",
+  "Ifi203", "Ifi204", "Ifi205", "Ifi207", "Ifi209"
+)
+
+# Restrict to IFN-response microglia in the two AD conditions
+micro_ifn_ad <- subset(
+  micro_sub,
+  subset = micro_subtype == "Interferon" &
+    Condition %in% c("AD", "AD-CXCL14")
+)
+DefaultAssay(micro_ifn_ad) <- "RNA"
+
+# The RNA data layer is expected to contain log-normalized expression.
+# JoinLayers is included only if this assay has split layers; inspect the
+# Seurat assay structure if this operation differs from the original pipeline.
+# micro_ifn_ad <- JoinLayers(micro_ifn_ad, assay = "RNA")
+
+rna_ifn <- GetAssayData(micro_ifn_ad, assay = "RNA", layer = "data")
+available_ifn_genes <- ifn_genes[ifn_genes %in% rownames(rna_ifn)]
+missing_ifn_genes <- setdiff(ifn_genes, available_ifn_genes)
+if (length(missing_ifn_genes)) {
+  message("Missing IFN genes: ", paste(missing_ifn_genes, collapse = ", "))
+}
+if (!length(available_ifn_genes)) stop("No IFN signature genes found")
+
+# Confirm one biological condition per sample
+sample_key <- micro_ifn_ad@meta.data %>%
+  distinct(sample, Condition) %>%
+  as.data.frame()
+stopifnot(!anyDuplicated(sample_key$sample), !anyNA(sample_key$Condition))
+sample_key$Condition <- factor(sample_key$Condition,
+                               levels = c("AD", "AD-CXCL14"))
+sample_key <- sample_key[order(sample_key$Condition, sample_key$sample), , drop = FALSE]
+print(sample_key)
+```
+
+### IFN signature heatmap
+
+The heatmap uses Seurat's `AverageExpression()` on the RNA log-normalized data layer, then applies row-wise Z-score scaling. Samples are displayed AD first and AD-CXCL14 second without row or column clustering.
+
+```{r ifn-signature-heatmap}
+avg_ifn_sample <- AverageExpression(
+  micro_ifn_ad,
+  group.by = "sample",
+  features = available_ifn_genes,
+  assays = "RNA",
+  layer = "data",
+  verbose = FALSE
+)$RNA
+
+# Seurat can prefix sample identifiers beginning with digits with "g".
+# Resolve both possible forms without assuming how a particular version behaves.
+expected_samples <- as.character(sample_key$sample)
+resolve_col <- function(sid) {
+  candidates <- c(sid, paste0("g", sid))
+  matches <- intersect(candidates, colnames(avg_ifn_sample))
+  if (length(matches) != 1L) {
+    stop("Cannot uniquely match sample ", sid, " to AverageExpression columns")
+  }
+  matches
+}
+avg_columns <- vapply(expected_samples, resolve_col, character(1))
+
+mat_ifn <- as.matrix(avg_ifn_sample[
+  available_ifn_genes, avg_columns, drop = FALSE
+])
+colnames(mat_ifn) <- expected_samples
+
+#  removed genes with zero variance / invalid values.
+valid_rows <- apply(mat_ifn, 1, function(x) {
+  all(is.finite(x)) && is.finite(stats::sd(x)) && stats::sd(x) > 0
+})
+mat_ifn <- mat_ifn[valid_rows, , drop = FALSE]
+if (!nrow(mat_ifn)) stop("No variable IFN genes remain for heatmap")
+
+annotation_ifn <- data.frame(Condition = sample_key$Condition)
+rownames(annotation_ifn) <- expected_samples
+stopifnot(identical(rownames(annotation_ifn), colnames(mat_ifn)))
+
+ann_colors_ifn <- list(
+  Condition = c("AD" = "#F8766D", "AD-CXCL14" = "#00BFC4")
+)
+
+pheatmap::pheatmap(
+  mat_ifn,
+  scale = "row",
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  gaps_col = sum(annotation_ifn$Condition == "AD"),
+  annotation_col = annotation_ifn,
+  annotation_colors = ann_colors_ifn,
+  fontsize_row = 18,
+  fontsize_col = 10,
+  angle_col = 45,
+  border_color = NA,
+  main = "Type I IFN signature (microglia)"
+)
+```
+
+### IFN expression score by biological sample
+
+For each cell, calculate the mean log-normalized expression of the detected IFN signature genes, then take the mean across IFN-response microglia from each mouse. .
+
+```{r ifn-signature-score}
+# Use the same selected IFN-response microglia and expression layer as above.
+# Calculating on micro_sub before subsetting gives identical per-cell raw scores;
+
+ifn_cell_scores <- Matrix::colMeans(
+  rna_ifn[available_ifn_genes, , drop = FALSE]
+)
+micro_ifn_ad$IFNscore_raw <- ifn_cell_scores[colnames(micro_ifn_ad)]
+
+# Optional within-subset Z-score; not used for sample means
+micro_ifn_ad$IFNscore_z <- as.numeric(scale(micro_ifn_ad$IFNscore_raw))
+
+sample_means <- micro_ifn_ad@meta.data %>%
+  group_by(sample, Condition) %>%
+  summarise(
+    mean_IFN = mean(IFNscore_raw, na.rm = TRUE),
+    n_cells = dplyr::n(),
+    .groups = "drop"
+  ) %>%
+  mutate(Condition = factor(Condition, levels = c("AD", "AD-CXCL14"))) %>%
+  arrange(Condition, sample)
+
+print(sample_means)
+
+# Optional: show individual biological replicates 
+ggplot(sample_means, aes(x = Condition, y = mean_IFN, color = Condition)) +
+  geom_point(size = 3) +
+  labs(x = NULL, y = "Mean IFN signature expression per sample") +
+  theme_classic(base_size = 14) +
+  theme(legend.position = "none")
+
+```
+
+
+```{r}
+
+## Microglial cell-state marker expression
+
+
+library(Seurat)
+library(ggplot2)
+
+# 1. Set the order of microglial subpopulations
+state_order <- c(
+  "Homeostatic",
+  "Primed",
+  "DAM",
+  "Interferon",
+  "Cycling"
+)
+
+micro_sub_dotplot <- micro_sub
+
+micro_sub_dotplot$micro_subtype <- factor(
+  micro_sub_dotplot$micro_subtype,
+  levels = state_order
+)
+
+Idents(micro_sub_dotplot) <- "micro_subtype"
+
+# 2. Define canonical marker genes for each state
+microglia_markers <- list(
+  Homeostatic = c("P2ry12", "Tmem119", "Cx3cr1"),
+  Primed      = c("Arhgap15", "Ipcef1", "Oprm1"),
+  DAM         = c("Tyrobp", "Trem2", "Apoe", "Ctsd", "Ctsb"),
+  Interferon  = c("Mx1", "Ifit3", "Oasl2"),
+  Cycling     = c("Mki67", "Top2a", "Birc5")
+)
+
+# 3. Prepare markers and their assigned gene groups
+microglia_markers_vector <- unique(unlist(microglia_markers))
+
+missing_genes <- setdiff(
+  microglia_markers_vector,
+  rownames(micro_sub_dotplot)
+)
+
+if (length(missing_genes) > 0) {
+  message("Markers not found: ", paste(missing_genes, collapse = ", "))
+}
+
+microglia_markers_vector <- intersect(
+  microglia_markers_vector,
+  rownames(micro_sub_dotplot)
+)
+
+gene_groups <- stack(microglia_markers)
+colnames(gene_groups) <- c("gene", "gene_set")
+
+gene_groups$gene_set <- factor(
+  gene_groups$gene_set,
+  levels = state_order
+)
+
+# 4. Generate expression dot plot
+p <- DotPlot(
+  micro_sub_dotplot,
+  features = microglia_markers_vector,
+  group.by = "micro_subtype",
+  assay = "RNA",
+  dot.scale = 9,
+  scale.by = "size"
+)
+
+# Associate each gene with its marker category
+p$data$gene_set <- gene_groups$gene_set[
+  match(as.character(p$data$features.plot), gene_groups$gene)
+]
+
+# 5. Final grouped plot
+p_grouped <- p +
+  facet_grid(
+    cols = vars(gene_set),
+    scales = "free_x",
+    space = "free_x"
+  ) +
+  labs(x = NULL, y = NULL) +
+  theme(
+    text = element_text(size = 14, face = "bold"),
+    axis.text.x = element_text(
+      size = 13,
+      face = "bold",
+      angle = 45,
+      hjust = 1
+    ),
+    axis.text.y = element_text(
+      size = 14,
+      face = "bold"
+    ),
+    strip.text.x = element_text(
+      size = 13,
+      face = "bold"
+    ),
+    legend.title = element_text(
+      size = 14,
+      face = "bold"
+    ),
+    legend.text = element_text(
+      size = 12,
+      face = "bold"
+    )
+  )
+
+p_grouped
+
+```
+
+
+

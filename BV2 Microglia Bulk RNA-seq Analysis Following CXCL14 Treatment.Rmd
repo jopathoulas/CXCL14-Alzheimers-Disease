@@ -1,0 +1,222 @@
+---
+title: "BV2 Microglial Bulk RNA-seq Analysis Following CXCL14 Treatment"
+output: html_document
+date: "2025-12-19"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This document contains the R analysis of bulk RNA-seq count data from BV2 microglial cells assigned to control (`Con`) or CXCL14-treated (`CXCL14`) groups. The original workflow used HTSeq-style gene count files, DESeq2 for differential expression, Reactome and Gene Ontology for enrichment, and variance-stabilized expression for heatmaps.
+
+```{r}
+## 1. Load required packages
+library(DESeq2)
+library(dplyr)
+library(ggplot2)
+library(apeglm)
+library(AnnotationDbi)
+library(org.Mm.eg.db)
+library(ReactomePA)
+library(clusterProfiler)
+library(pheatmap)
+```
+
+```{r}
+## 2. Read HTSeq gene-count files
+##processed data files found on GEO GSE352519
+count_dir <- file.path("data", "BV2_counts")
+
+htseq_to_counts <- function(path.dir, file.suffix = ".counts.txt") {
+  files <- sort(Sys.glob(file.path(path.dir, paste0("*", file.suffix))))
+  if (length(files) == 0) stop("No matching count files found in: ", path.dir)
+  message("Found ", length(files), " count files")
+
+  counts_list <- lapply(files, function(f) {
+    x <- read.table(f, header = FALSE, stringsAsFactors = FALSE)
+    if (ncol(x) != 2) stop("Expected two columns in ", f)
+    colnames(x) <- c("gene", "count")
+    x
+  })
+
+  reference_genes <- counts_list[[1]]$gene
+  if (!all(vapply(counts_list, function(x) identical(x$gene, reference_genes), logical(1)))) {
+    stop("Gene identifiers are not in identical order across input files")
+  }
+
+  count_mat <- do.call(cbind, lapply(counts_list, function(x) x$count))
+  rownames(count_mat) <- reference_genes
+  colnames(count_mat) <- sub(paste0("\\Q", file.suffix, "\\E$"), "", basename(files), perl = TRUE)
+  count_mat <- count_mat[!grepl("^__", rownames(count_mat)), , drop = FALSE]
+  storage.mode(count_mat) <- "integer"
+  count_mat
+}
+
+count_matrix <- htseq_to_counts(count_dir)
+head(count_matrix[, seq_len(min(3, ncol(count_matrix))), drop = FALSE])
+```
+
+```{r}
+## 3. Differential expression analysis (DESeq2)
+#The reference group is `Con`; positive log2 fold changes indicate greater expression in `CXCL14` than `Con`. Genes were retained if their count was at least 10 in at least the size of the smallest experimental group.
+condition <- factor(
+  vapply(strsplit(colnames(count_matrix), "-"), `[`, character(1), 1),
+  levels = c("Con", "CXCL14")
+)
+if (anyNA(condition)) stop("Sample names must begin with Con- or CXCL14-")
+coldata <- data.frame(condition = condition, row.names = colnames(count_matrix))
+print(table(coldata$condition))
+
+dds <- DESeqDataSetFromMatrix(
+  countData = count_matrix,
+  colData = coldata,
+  design = ~ condition
+)
+dds$condition <- relevel(dds$condition, ref = "Con")
+smallestGroupSize <- min(table(dds$condition))
+keep <- rowSums(counts(dds) >= 10) >= smallestGroupSize
+dds <- dds[keep, ]
+dds <- DESeq(dds)
+
+res <- results(dds, contrast = c("condition", "CXCL14", "Con"))
+summary(res)
+res_shrunk <- lfcShrink(dds, coef = "condition_CXCL14_vs_Con", type = "apeglm")
+plotDispEsts(dds)
+vsd <- vst(dds, blind = FALSE)
+plotPCA(vsd, intgroup = "condition")
+```
+
+## 4. Gene identifier annotation
+
+The pipeline mapped mouse Ensembl IDs to gene symbols and Entrez IDs using `org.Mm.eg.db`. 
+
+```{r gene-ids}
+res_df <- as.data.frame(res_shrunk)
+res_df$symbol <- AnnotationDbi::mapIds(
+  org.Mm.eg.db, keys = rownames(res_df), column = "SYMBOL",
+  keytype = "ENSEMBL", multiVals = "first"
+)
+res_df$entrez <- AnnotationDbi::mapIds(
+  org.Mm.eg.db, keys = rownames(res_df), column = "ENTREZID",
+  keytype = "ENSEMBL", multiVals = "first"
+)
+res_df <- dplyr::select(res_df, symbol, entrez, everything())
+head(res_df)
+
+
+```
+
+```{r}
+
+## 5. Prepare heatmaps of selected gene signatures
+# Heatmaps use variance-stabilized expression values from DESeq2.
+# Expression is scaled by row (gene) to obtain Z-scores.
+# Samples are ordered by treatment condition without clustering.
+
+mat_all <- SummarizedExperiment::assay(vsd)
+
+plot_bv2_heatmap <- function(selected_symbols, plot_title) {
+
+  # Map mouse gene symbols to Ensembl gene identifiers
+  sym2ens <- AnnotationDbi::mapIds(
+    org.Mm.eg.db,
+    keys = selected_symbols,
+    column = "ENSEMBL",
+    keytype = "SYMBOL",
+    multiVals = "first"
+  )
+
+  # Retain genes present in the expression matrix
+  keep_syms <- names(sym2ens)[
+    !is.na(sym2ens) & sym2ens %in% rownames(mat_all)
+  ]
+  sym2ens <- sym2ens[keep_syms]
+
+  missing_syms <- setdiff(selected_symbols, keep_syms)
+  if (length(missing_syms) > 0) {
+    message("Genes not found: ", paste(missing_syms, collapse = ", "))
+  }
+
+  # Extract expression values in the specified gene order
+  mat <- mat_all[unname(sym2ens), , drop = FALSE]
+  rownames(mat) <- names(sym2ens)
+
+  # Order samples: Control followed by CXCL14
+  sample_order <- order(dds$condition)
+  mat <- mat[, sample_order, drop = FALSE]
+  cond <- dds$condition[sample_order]
+
+  # Rename columns for visualization
+  colnames(mat) <- paste0(
+    cond, "-",
+    ave(as.character(cond), cond, FUN = seq_along)
+  )
+
+  # Sample annotations
+  anno_col <- data.frame(Condition = cond)
+  rownames(anno_col) <- colnames(mat)
+
+  ann_colors <- list(
+    Condition = c(
+      "Con" = "#BDBDBD",
+      "CXCL14" = "#7FC97F"
+    )
+  )
+
+  gap_after_con <- sum(cond == "Con")
+
+  # Generate heatmap
+  pheatmap::pheatmap(
+    mat,
+    scale = "row",
+    cluster_rows = FALSE,
+    cluster_cols = FALSE,
+    gaps_col = gap_after_con,
+    annotation_col = anno_col,
+    annotation_colors = ann_colors,
+    fontsize_row = 18,
+    fontsize_col = 10,
+    angle_col = 45,
+    border_color = NA,
+    main = plot_title
+  )
+}
+
+
+## 6. Type I interferon signaling heatmap (Main Figure 4C)
+
+ifn_final_candidate <- c(
+  "Ifi203", "Ifi205", "Irf3", "Stat2",
+  "Mx1", "Mx2", "Oas2", "Oas3",
+  "Isg15", "Uba7", "Socs1", "Socs3",
+  "Pias2", "Pias3", "Pias4"
+)
+
+plot_bv2_heatmap(
+  selected_symbols = ifn_final_candidate,
+  plot_title = "Type I IFN signature (BV2 bulk RNA-seq)"
+)
+
+
+## 7. Phagocytosis heatmap (Supplementary Figure S5A)
+
+phago_early_revised <- c(
+  "Mertk", "Syk", "Fgd2", "Arhgef25",
+  "Arhgef4", "Arhgap4", "Arhgap27",
+  "Arhgap33", "Arhgap39", "Arhgap45",
+  "Rab24"
+)
+
+plot_bv2_heatmap(
+  selected_symbols = phago_early_revised,
+  plot_title = "Early phagocytic priming signature (BV2, 2h CXCL14)"
+)
+
+
+
+
+```
+

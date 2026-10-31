@@ -1,0 +1,590 @@
+---
+title: "Primary Microglial Bulk RNA-seq Analysis Following CXCL14 Treatment"
+output: html_document
+date: "2025-12-19"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+# Primary microglial bulk RNA-seq: CXCL14 versus control
+
+This document reproduces the downstream R analysis of HTSeq gene counts from primary mouse microglia treated for 2 hours with CXCL14 or control. Count files were generated from the sequencing workflow described in the manuscript. The analysis here starts from **processed** HTSeq counts, not FASTQ files. Keep count files in `data/primary_counts/` and name them `Con-*.counts.txt` and `CXCL14-*.counts.txt`. Sample identity and experimental design should be verified against the deposited metadata.Raw and processed data deposited on GEO GSE352519. 
+
+## 1. Packages
+
+```{r packages}
+library(DESeq2)
+library(dplyr)
+library(ggplot2)
+library(apeglm)
+library(AnnotationDbi)
+library(org.Mm.eg.db)
+library(ReactomePA)
+library(clusterProfiler)
+library(pheatmap)
+library(stringr)
+library(ggrepel)
+library(tibble)
+```
+
+## 2. Load HTSeq counts
+
+```{r import}
+count_dir <- file.path("data", "primary_counts")
+htseq_to_counts <- function(path.dir, file.suffix = ".counts.txt") {
+  files <- sort(Sys.glob(file.path(path.dir, paste0("*", file.suffix))))
+  if (!length(files)) stop("No HTSeq files found in ", path.dir)
+  tables <- lapply(files, function(f) {
+    x <- read.table(f, header = FALSE, stringsAsFactors = FALSE)
+    if (ncol(x) != 2L) stop("Expected two columns in ", f)
+    names(x) <- c("gene", "count")
+    x
+  })
+  genes <- tables[[1]]$gene
+  if (!all(vapply(tables, function(x) identical(x$gene, genes), logical(1)))) {
+    stop("Gene IDs/order differ among count files")
+  }
+  m <- do.call(cbind, lapply(tables, `[[`, "count"))
+  rownames(m) <- genes
+  colnames(m) <- sub(paste0("\\Q", file.suffix, "\\E$"), "", basename(files), perl = TRUE)
+  m <- m[!grepl("^__", rownames(m)), , drop = FALSE]
+  storage.mode(m) <- "integer"
+  m
+}
+count_matrix <- htseq_to_counts(count_dir)
+head(count_matrix)
+```
+
+## 3. Differential expression with DESeq2
+
+The original workflow used `Con` as reference; genes were kept with counts >= 10 in at least as many samples as the smallest treatment group.
+
+```{r deseq}
+condition <- factor(vapply(strsplit(colnames(count_matrix), "-"), `[`, character(1), 1),
+                    levels = c("Con", "CXCL14"))
+if (anyNA(condition)) stop("Sample names must start Con- or CXCL14-")
+coldata <- data.frame(condition = condition, row.names = colnames(count_matrix))
+print(table(coldata$condition))
+dds <- DESeqDataSetFromMatrix(countData = count_matrix, colData = coldata,
+                              design = ~ condition)
+dds$condition <- relevel(dds$condition, ref = "Con")
+smallestGroupSize <- min(table(dds$condition))
+keep <- rowSums(counts(dds) >= 10) >= smallestGroupSize
+dds <- dds[keep, ]
+dds <- DESeq(dds)
+res <- results(dds, contrast = c("condition", "CXCL14", "Con"))
+res_shrunk <- lfcShrink(dds, coef = "condition_CXCL14_vs_Con", type = "apeglm")
+summary(res)
+plotDispEsts(dds)
+vsd <- vst(dds, blind = FALSE)
+plotPCA(vsd, intgroup = "condition")
+```
+
+## 4. Map gene identifiers
+
+
+```{r mapping}
+res_df <- as.data.frame(res_shrunk)
+res_df$symbol <- AnnotationDbi::mapIds(org.Mm.eg.db, keys = rownames(res_df),
+  column = "SYMBOL", keytype = "ENSEMBL", multiVals = "first")
+res_df$entrez <- AnnotationDbi::mapIds(org.Mm.eg.db, keys = rownames(res_df),
+  column = "ENTREZID", keytype = "ENSEMBL", multiVals = "first")
+res_df <- dplyr::select(res_df, symbol, entrez, everything())
+head(res_df)
+```
+
+## 5. Reactome GSEA 
+
+```{r reactome}
+ranks_sig <- sign(res_df$log2FoldChange) * -log10(res_df$pvalue)
+names(ranks_sig) <- res_df$entrez
+ranks_sig <- ranks_sig[!is.na(names(ranks_sig)) & is.finite(ranks_sig)]
+if (anyDuplicated(names(ranks_sig))) {
+  warning
+}
+ranks_sig <- sort(ranks_sig, decreasing = TRUE)
+ego_react_sig <- ReactomePA::gsePathway(
+  geneList = ranks_sig, organism = "mouse", pvalueCutoff = 1, verbose = TRUE)
+resR <- as.data.frame(ego_react_sig@result)
+resR$core_list <- strsplit(resR$core_enrichment, "/")
+
+jaccard <- function(a, b) {
+  a <- unique(a); b <- unique(b)
+  if (!length(a) || !length(b)) return(0)
+  length(intersect(a, b)) / length(union(a, b))
+}
+simplify_jaccard_gsea <- function(df, cutoff = 0.3) {
+  df <- df %>% arrange(p.adjust, desc(abs(NES))) %>% mutate(keep = TRUE)
+  kept_idx <- integer(0)
+  for (i in seq_len(nrow(df))) {
+    if (length(kept_idx) && any(vapply(kept_idx, function(k)
+       jaccard(df$core_list[[i]], df$core_list[[k]]), numeric(1)) >= cutoff)) {
+      df$keep[i] <- FALSE
+    } else {
+      kept_idx <- c(kept_idx, i)
+    }
+  }
+  df %>% filter(keep) %>% select(-keep)
+}
+resR_slim <- simplify_jaccard_gsea(resR, cutoff = 0.3)
+```
+
+### Figure 4A: top upregulated Reactome pathways
+
+```{r reactome-plot}
+##shortening again 
+plot_up <- resR_slim %>%
+  filter(!is.na(NES), NES > 0) %>%
+  slice_max(order_by = NES, n = 10) %>%
+  mutate(
+    neglog10p = -log10(p.adjust),
+    Description = str_to_sentence(Description)
+  ) %>%
+  mutate(
+    # optional label cleanups
+    Description = gsub("\\btype ii\\b", "type II", Description, ignore.case = TRUE),
+    Description = gsub("\\bb cell\\b", "B cell", Description, ignore.case = TRUE),
+    Description = gsub("^Erad", "ERAD", Description, ignore.case = TRUE),
+    Description = gsub("^Er-", "ER–", Description, ignore.case = TRUE),
+    Description = gsub("er nucleus", "ER–nucleus", Description, ignore.case = TRUE),
+    Description = gsub("^Dna", "DNA", Description),
+    Description = gsub("Interferon-alpha", "Interferon-α", Description),
+    Description = gsub("Interferon beta", "Interferon-β", Description, ignore.case = TRUE),
+    Description = gsub("nf-kappa b", "NF-κB", Description, ignore.case = TRUE),
+    Description = gsub("mhc", "MHC", Description, ignore.case = TRUE),
+    Description = gsub("\\bMrna\\b", "mRNA", Description),
+    Description = gsub("\\bDdx58\\b", "DDX58", Description),
+    Description = gsub("\\bifih1\\b", "IFIH1", Description),
+    Description = gsub("\\bIsg15\\b", "ISG15", Description),
+    Description = gsub("interferon-alpha/beta", "interferon-α/β", Description),
+    Description = gsub("\\brna pol ii\\b", "RNA Pol II", Description, ignore.case = TRUE),
+    Description = gsub("\\bbcr\\b", "BCR", Description, ignore.case = TRUE),
+    Description = gsub("\\bdna synthesis\\b", "DNA synthesis", Description, ignore.case = TRUE),
+    Description = gsub("\\s+", " ", Description),
+
+  
+    Description = dplyr::case_when(
+      Description == "Antigen activates B cell receptor (BCR) leading to generation of second messengers" ~
+        "BCR signaling",
+      Description == "Regulation of actin dynamics for phagocytic cup formation" ~
+        "Phagocytic cup formation",
+      TRUE ~ Description
+    ),
+
+    # wrap last
+    Description = stringr::str_wrap(Description, width = 50)
+  ) %>%
+  arrange(NES) %>%
+  mutate(Description = factor(Description, levels = Description))
+
+ggplot(plot_up, aes(x = NES, y = Description, fill = neglog10p)) +
+  geom_col(width = 0.8) +
+  scale_fill_viridis_c(
+    option = "viridis",
+    name = expression(-log[10]("adjusted p-value"))
+  ) +
+  labs(x = "NES", y = NULL) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.text.y = element_text(size = 20, face = "bold", color = "black"),
+    axis.text.x = element_text(size = 12, face = "bold")
+  )
+
+
+```
+
+## 6. Primary microglia IFN heatmap 
+
+```{r ifn-heatmap}
+##heatmap of IFN genes
+selected_symbols <- c(
+    # sensing / IFI family
+  "Ifi203","Ifi204","Ifi205","Ifi207",
+  # TFs
+  "Stat1","Stat2","Irf3","Irf7",
+  # effector ISGs
+  "Isg15","Mx1","Oas2","Oas3","Gbp2","Gbp3",
+
+  # negative regulators
+  "Usp18","Socs1","Socs2","Parp14"
+)
+
+
+library(DESeq2)
+library(org.Mm.eg.db)
+library(dplyr)
+library(tibble)
+library(pheatmap)
+
+# variance-stabilized expression (better than raw normalized counts for heatmaps)
+vsd <- vst(dds, blind = FALSE)
+mat_all <- assay(vsd)   # genes x samples
+
+
+
+sym2ens <- AnnotationDbi::mapIds(
+  org.Mm.eg.db,
+  keys = selected_symbols,
+  column = "ENSEMBL",
+  keytype = "SYMBOL",
+  multiVals = "first"
+)
+
+# keep only genes that mapped + are in your expression matrix
+keep_syms <- names(sym2ens)[!is.na(sym2ens) & sym2ens %in% rownames(mat_all)]
+sym2ens <- sym2ens[keep_syms]
+
+# subset matrix in the exact order of your selected symbols
+mat <- mat_all[sym2ens, , drop = FALSE]
+rownames(mat) <- names(sym2ens)  # show SYMBOLs on the heatmap rows
+
+
+# make sure levels are Con first
+dds$condition <- factor(dds$condition, levels = c("Con","CXCL14"))
+
+sample_order <- order(dds$condition)
+mat <- mat[, sample_order, drop = FALSE]
+
+# clean colnames like Con-1, Con-2, CXCL14-1...
+cond <- dds$condition[sample_order]
+colnames(mat) <- paste0(cond, "-", ave(as.character(cond), cond, FUN = seq_along))
+
+
+
+anno_col <- data.frame(Condition = cond)
+rownames(anno_col) <- colnames(mat)
+
+ann_colors <- list(
+  Condition = c(
+    "Con"    = "#BDBDBD",  # light neutral gray
+    "CXCL14" = "#7FC97F"   # soft light green
+  )
+)
+
+gap_after_con <- sum(cond == "Con")
+
+
+
+pheatmap(
+  mat,
+  scale = "row",                 # Z-score per gene
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  gaps_col = gap_after_con,
+  annotation_col = anno_col,
+  annotation_colors = ann_colors,
+  fontsize_row = 18,
+  fontsize_col = 10,
+  angle_col = 45,
+  border_color = NA,
+  main = "Type I IFN signature (bulk primary microglia)"
+)
+
+```
+
+## 7. Phagocytosis heatmap 
+
+```{r phagocytosis-heatmap}
+##phagocytosis heatmap
+selected_symbols <- c(
+  "Axl","Tyro3","Syk","Vav3","Fcgr1","Lgals9","Lgals3bp","Gpr65",
+  "Rab7b","Rab11fip5","Dock8","Arhgef2","Arhgap22","Fgd2",
+  "Ctss","Ctsa","Ctsz"
+)
+
+library(DESeq2)
+library(org.Mm.eg.db)
+library(AnnotationDbi)
+library(dplyr)
+library(tibble)
+library(pheatmap)
+
+# 1) VST matrix (do this once per session; if you already have vsd/mat_all, reuse them)
+vsd <- vst(dds, blind = FALSE)
+mat_all <- assay(vsd)   # genes x samples
+
+# 2) Map SYMBOL -> ENSEMBL (handle missing genes gracefully)
+sym2ens <- AnnotationDbi::mapIds(
+  org.Mm.eg.db,
+  keys = selected_symbols,
+  column = "ENSEMBL",
+  keytype = "SYMBOL",
+  multiVals = "first"
+)
+
+# keep only genes that mapped + are in expression matrix
+keep_syms <- names(sym2ens)[!is.na(sym2ens) & sym2ens %in% rownames(mat_all)]
+sym2ens <- sym2ens[keep_syms]
+
+# subset matrix (in your preferred order)
+mat <- mat_all[sym2ens, , drop = FALSE]
+rownames(mat) <- names(sym2ens)
+
+# (optional) see what dropped out
+setdiff(selected_symbols, rownames(mat))
+
+# 3) Column order: Con first, then CXCL14
+dds$condition <- factor(dds$condition, levels = c("Con","CXCL14"))
+sample_order <- order(dds$condition)
+mat <- mat[, sample_order, drop = FALSE]
+
+cond <- dds$condition[sample_order]
+colnames(mat) <- paste0(cond, "-", ave(as.character(cond), cond, FUN = seq_along))
+
+# 4) Annotation bar + colors
+anno_col <- data.frame(Condition = cond)
+rownames(anno_col) <- colnames(mat)
+
+ann_colors <- list(
+  Condition = c(
+    "Con"    = "#BDBDBD",
+    "CXCL14" = "#7FC97F"
+  )
+)
+
+gap_after_con <- sum(cond == "Con")
+
+# 5) Heatmap
+pheatmap(
+  mat,
+  scale = "row",
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  gaps_col = gap_after_con,
+  annotation_col = anno_col,
+  annotation_colors = ann_colors,
+  fontsize_row = 18,
+  fontsize_col = 10,
+  angle_col = 45,
+  border_color = NA,
+  main = "Phagocytosis / DAP12-adjacent genes (bulk primary microglia)"
+)
+
+```
+
+## 8. Reactome GSEA running-enrichment plots (primary microglia)
+
+The following analysis generates running-enrichment (“random walk”) plots for two
+Reactome interferon-related pathways in CXCL14-treated primary microglia. The
+plots display all pathway-hit ticks, with labels selected by a greedy spacing
+algorithm to reduce overlap. The ranking vector `ranks_sig` is generated in the
+preceding Reactome GSEA section; it must be a sorted numeric vector named by
+mouse Entrez gene IDs.
+
+```{r primary-reactome-running-enrichment, fig.width=12, fig.height=12}
+# Required packages (may already have been loaded above)
+library(dplyr)
+library(msigdbr)
+library(fgsea)
+library(ggplot2)
+library(patchwork)
+library(org.Mm.eg.db)
+library(AnnotationDbi)
+
+# A ranked vector of unique Entrez IDs must have been created earlier.
+stopifnot(is.numeric(ranks_sig), !is.null(names(ranks_sig)))
+stopifnot(!anyNA(names(ranks_sig)), !anyDuplicated(names(ranks_sig)))
+stopifnot(all(is.finite(ranks_sig)))
+ranks_sig <- sort(ranks_sig, decreasing = TRUE)
+
+# 8.1. Retrieve mouse Reactome pathway gene sets from MSigDB.
+# This uses the msigdbr argument names in the original analysis.
+msig_reactome <- msigdbr(
+  species = "Mus musculus", category = "C2", subcategory = "CP:REACTOME"
+)
+
+reactome_list <- msig_reactome %>%
+  filter(!is.na(entrez_gene)) %>%
+  group_by(gs_name) %>%
+  summarise(genes = list(as.character(unique(entrez_gene))), .groups = "drop")
+
+pathways <- setNames(reactome_list$genes, reactome_list$gs_name)
+
+find_reactome <- function(pattern) {
+  hits <- grep(pattern, names(pathways), value = TRUE, ignore.case = TRUE)
+  if (length(hits) == 0) stop("No Reactome pathway matched: ", pattern)
+  if (length(hits) > 1) {
+    message("Multiple Reactome matches; using first: ", hits[1],
+            ". Review all matches: ", paste(hits, collapse = "; "))
+  }
+  hits[1]
+}
+
+pw1_name <- find_reactome("DDX58.*IFIH1|IFIH1.*DDX58|DDX58/IFIH1")
+pw2_name <- find_reactome("ISG15.*ANTIVIRAL")
+message("Reactome pathway 1: ", pw1_name)
+message("Reactome pathway 2: ", pw2_name)
+
+pw1_genes <- pathways[[pw1_name]]
+pw2_genes <- pathways[[pw2_name]]
+
+# 8.2. Run GSEA for these two pathways.
+set.seed(1)
+fg <- fgsea(
+  pathways = list(
+    "DDX58/IFIH1-mediated induction of IFN-α/β" = pw1_genes,
+    "ISG15 antiviral mechanism" = pw2_genes
+  ),
+  stats = ranks_sig,
+  minSize = 10,
+  maxSize = 500
+)
+
+print(
+  dplyr::as_tibble(fg) %>%
+    dplyr::select(pathway, size, NES, pval, padj) %>%
+    dplyr::arrange(padj)
+)
+
+# 8.3. Calculate running enrichment score for positioning labels.
+compute_running_es <- function(pathway_genes, ranks_sig) {
+  stats <- sort(ranks_sig, decreasing = TRUE)
+  hits <- names(stats) %in% pathway_genes
+  Nh <- sum(hits)
+  Nm <- length(stats) - Nh
+  if (Nh == 0 || Nm == 0) stop("Pathway must overlap some, but not all, ranked genes")
+
+  hit_weights <- abs(stats)
+  norm_hit <- sum(hit_weights[hits])
+  if (norm_hit == 0) stop("All pathway hit weights are zero")
+
+  inc_hit <- ifelse(hits, hit_weights / norm_hit, 0)
+  inc_miss <- ifelse(!hits, 1 / Nm, 0)
+  data.frame(rank = seq_along(stats), running_es = cumsum(inc_hit - inc_miss))
+}
+
+# 8.4. Select high-scoring gene labels with minimum horizontal spacing.
+# This changes labels only, not the underlying enrichment curve or all hit ticks.
+thin_labels_greedy <- function(df, min_gap = 60, max_labels = 18) {
+  df <- df %>%
+    filter(!is.na(rank), !is.na(score), !is.na(symbol)) %>%
+    arrange(desc(abs(score)))
+
+  kept <- df[0, , drop = FALSE]
+  for (i in seq_len(nrow(df))) {
+    if (nrow(kept) >= max_labels) break
+    r <- df$rank[i]
+    if (nrow(kept) == 0 || all(abs(r - kept$rank) >= min_gap)) {
+      kept <- bind_rows(kept, df[i, ])
+    }
+  }
+  kept %>% arrange(rank)
+}
+
+# 8.5. Plot running enrichment with the original publication label styling.
+make_plot_with_thinned_tick_labels <- function(pathway_genes,
+                                               pathway_key,
+                                               title_text,
+                                               fg,
+                                               ranks_sig,
+                                               label_mode = c("leadingEdge", "allHits"),
+                                               min_gap = 60,
+                                               max_labels = 18,
+                                               label_y_frac = 0.12,
+                                               angle = 90,
+                                               text_size = 3.0) {
+  label_mode <- match.arg(label_mode)
+  fg_row <- fg[fg$pathway == pathway_key, ]
+  if (nrow(fg_row) != 1) stop("Could not uniquely match pathway: ", pathway_key)
+
+  NES_val <- fg_row$NES[1]
+  padj_val <- fg_row$padj[1]
+  ranked_entrez <- names(ranks_sig)
+
+  label_entrez <- if (label_mode == "leadingEdge") {
+    as.character(fg_row$leadingEdge[[1]])
+  } else {
+    intersect(as.character(pathway_genes), ranked_entrez)
+  }
+
+  lab_df <- data.frame(
+    entrez = label_entrez,
+    rank = match(label_entrez, ranked_entrez)
+  ) %>% filter(!is.na(rank))
+
+  lab_df$symbol <- AnnotationDbi::mapIds(
+    org.Mm.eg.db,
+    keys = lab_df$entrez,
+    column = "SYMBOL",
+    keytype = "ENTREZID",
+    multiVals = "first"
+  )
+
+  lab_df <- lab_df %>%
+    filter(!is.na(symbol)) %>%
+    mutate(score = ranks_sig[match(entrez, names(ranks_sig))])
+
+  lab_df_thin <- thin_labels_greedy(
+    lab_df, min_gap = min_gap, max_labels = max_labels
+  )
+
+  es_df <- compute_running_es(pathway_genes, ranks_sig)
+  label_y <- max(es_df$running_es, na.rm = TRUE) * label_y_frac
+
+  # plotEnrichment draws the full running curve and every pathway-hit tick.
+  fgsea::plotEnrichment(pathway_genes, ranks_sig) +
+    ggtitle(paste0(
+      title_text, "\n",
+      "NES=", round(NES_val, 2),
+      " | padj=", signif(padj_val, 2)
+    )) +
+    theme_classic(base_size = 18) +
+    theme(
+      plot.title = element_text(face = "bold", size = 18),
+      axis.title = element_text(face = "bold"),
+      axis.text = element_text(color = "black"),
+      plot.margin = margin(10, 10, 22, 10)
+    ) +
+    geom_text(
+      data = lab_df_thin,
+      aes(x = rank, y = label_y, label = symbol),
+      inherit.aes = FALSE,
+      angle = angle,
+      vjust = 0,
+      hjust = 0,
+      size = text_size,
+      fontface = "bold"
+    ) +
+    coord_cartesian(clip = "off")
+}
+
+# 8.6. Final publication plotting settings (as supplied).
+p1 <- make_plot_with_thinned_tick_labels(
+  pathway_genes = pw1_genes,
+  pathway_key = "DDX58/IFIH1-mediated induction of IFN-α/β",
+  title_text = "DDX58/IFIH1-mediated induction of IFN-α/β",
+  fg = fg,
+  ranks_sig = ranks_sig,
+  label_mode = "allHits",
+  min_gap = 100,
+  max_labels = 50,
+  label_y_frac = 0.12,
+  angle = 90,
+  text_size = 4.0
+)
+
+p2 <- make_plot_with_thinned_tick_labels(
+  pathway_genes = pw2_genes,
+  pathway_key = "ISG15 antiviral mechanism",
+  title_text = "ISG15 antiviral mechanism",
+  fg = fg,
+  ranks_sig = ranks_sig,
+  label_mode = "allHits",
+  min_gap = 100,
+  max_labels = 50,
+  label_y_frac = 0.12,
+  angle = 90,
+  text_size = 4.0
+)
+
+p1 / p2
+
+
+
+```
+
+

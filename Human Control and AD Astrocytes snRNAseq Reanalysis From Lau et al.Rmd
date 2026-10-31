@@ -1,0 +1,954 @@
+---
+title: "Human Control and AD Astrocytes From snRNAseq Lau et al"
+output: html_document
+date: "2025-12-13"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+
+This analysis reprocesses human AD and non-demented control (NC) nuclei from Lau et al.deposited on GEO GSE157827. 
+
+```{r packages}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(ggplot2)
+  library(stringr)
+  library(Matrix)
+  library(SingleCellExperiment)
+  library(celda)
+  library(scDblFinder)
+  library(harmony)
+  library(patchwork)
+  library(scales)
+  library(tibble)
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+  library(tidyr)
+  library(writexl)
+})
+```
+
+## 1. Data import, quality control, ambient RNA correction, and doublet removal
+
+```{r}
+base_dir <- "data/Human_AD_Lau2020_singlenuclear_files_110525" 
+stopifnot(dir.exists(base_dir))
+
+sample_dirs <- list.dirs(base_dir, full.names = TRUE, recursive = FALSE)
+stopifnot(length(sample_dirs) > 0)
+
+infer_condition <- function(id) {
+  if (!grepl("^(AD|NC)", id)) stop("Unexpected sample prefix: ", id)
+  ifelse(startsWith(id, "AD"), "AD", "NC")
+}
+
+#make samples into Seurat list
+seurat_list_raw <- list()
+for (sd in sample_dirs) {
+  sid <- basename(sd)
+  message("Reading ", sid)
+  mtx <- Read10X(sd)  # expects barcodes.tsv.gz, features.tsv.gz, matrix.mtx.gz
+  s <- CreateSeuratObject(counts = mtx, project = "Lau2020_humanAD")
+  s$sample <- sid
+  s$condition <- infer_condition(sid)
+  s[["percent.mt"]] <- PercentageFeatureSet(s, pattern = "^MT-")
+  seurat_list_raw[[sid]] <- s
+}
+saveRDS(seurat_list_raw, "snrna_raw_objs_human_AD_Lau2020.rds")
+
+##sample QC
+seurat_list_qc <- lapply(names(seurat_list_raw), function(sid){
+  s <- seurat_list_raw[[sid]]
+  subset(s, subset =
+           nFeature_RNA >= 300 &
+           nFeature_RNA <= 8000 &
+           nCount_RNA   >= 500 &
+           nCount_RNA   <= 40000 &
+           percent.mt   <= 5)
+})
+names(seurat_list_qc) <- names(seurat_list_raw)
+
+
+qc_summary_qc <- do.call(rbind, lapply(names(seurat_list_qc), function(sid) {
+  s <- seurat_list_qc[[sid]]
+  data.frame(
+    sample = sid,
+    cells = ncol(s),
+    median_nFeature = median(s$nFeature_RNA),
+    median_nCount   = median(s$nCount_RNA),
+    median_percent_mt = if ("percent.mt" %in% colnames(s[[]])) median(s$percent.mt) else NA_real_
+  )
+}))
+qc_summary_qc
+
+##Decontx ambient RNA removal
+decontx_results <- lapply(names(seurat_list_qc), function(sid) {
+  s <- seurat_list_qc[[sid]]
+
+  orig_counts <- GetAssayData(s, assay = "RNA", slot = "counts")
+  orig_per_cell <- Matrix::colSums(orig_counts)
+
+  sce <- as.SingleCellExperiment(s)
+  # threads=1 inside; parallelism is over samples
+  sce <- decontX(sce)
+
+  decon_counts <- SummarizedExperiment::assay(sce, "decontXcounts")
+  contam       <- SummarizedExperiment::colData(sce)$decontX_contamination
+  new_per_cell <- Matrix::colSums(decon_counts)
+  frac_removed <- 1 - (new_per_cell / orig_per_cell[colnames(decon_counts)])
+
+  s2 <- CreateSeuratObject(counts = decon_counts, assay = "RNA")
+  s2 <- AddMetaData(s2, as.data.frame(SummarizedExperiment::colData(sce)))
+  s2$sample <- s$sample[colnames(s2)]
+  s2$condition <- s$condition[colnames(s2)]
+  s2$decontX_frac_removed <- frac_removed[colnames(s2)]
+  s2[["RNA_raw"]] <- CreateAssayObject(counts = orig_counts[, colnames(s2), drop = FALSE])
+
+  # drop highly contaminated cells
+  s2 <- subset(s2, subset = decontX_contamination <= 0.20)
+
+  list(
+    seurat = s2,
+    per_cell = data.frame(
+      cell = colnames(s2),
+      sample = s2$sample,
+      decontX_contam = s2$decontX_contamination,
+      decontX_frac_removed = s2$decontX_frac_removed,
+      orig_counts = orig_per_cell[colnames(s2)],
+      new_counts  = new_per_cell[colnames(s2)]
+    )
+  )
+})
+seurat_list_decontx <- setNames(lapply(decontx_results, `[[`, "seurat"), names(seurat_list_qc))
+
+decontx_percell_tbl <- do.call(rbind, lapply(decontx_results, `[[`, "per_cell"))
+
+##Remove doublets with scDBLFinder
+seurat_list_clean <- lapply(names(seurat_list_decontx), function(sid) {
+  s <- seurat_list_decontx[[sid]]
+  sce <- as.SingleCellExperiment(s)
+  sce <- scDblFinder(sce)
+  sce <- sce[, sce$scDblFinder.class == "singlet"]
+
+  s2 <- CreateSeuratObject(
+    counts = SummarizedExperiment::assay(sce, "counts"),
+    assay  = "RNA"
+  )
+  s2 <- AddMetaData(s2, as.data.frame(colData(sce)))
+  # carry sample/condition post-subset
+  if (!"sample" %in% colnames(s2[[]]))    s2$sample <- s$sample[colnames(s2)]
+  if (!"condition" %in% colnames(s2[[]])) s2$condition <- s$condition[colnames(s2)]
+  # keep raw counts subset
+  s2[["RNA_raw"]] <- CreateAssayObject(GetAssayData(s, assay = "RNA_raw", layer = "counts")[, colnames(s2), drop = FALSE])
+  s2
+})
+names(seurat_list_clean) <- names(seurat_list_decontx)
+
+dbl_stats <- do.call(rbind, lapply(names(seurat_list_clean), function(sid) {
+  data.frame(
+    sample = sid,
+    singlets = ncol(seurat_list_clean[[sid]]),
+    removed_doublets = ncol(seurat_list_decontx[[sid]]) - ncol(seurat_list_clean[[sid]])
+  )
+}))
+
+print(dbl_stats)
+
+##rechecking qc
+qc_simple <- do.call(rbind, lapply(names(seurat_list_clean), function(sid) {
+  s <- seurat_list_clean[[sid]]
+  if (!"percent.mt" %in% colnames(s[[]])) {
+    s[["percent.mt"]] <- PercentageFeatureSet(s, "^MT-")
+  }
+  data.frame(
+    sample = sid,
+    cells = ncol(s),
+    median_nFeature = median(s$nFeature_RNA),
+    median_nCount   = median(s$nCount_RNA),
+    median_percent_mt = median(s$percent.mt)
+  )
+}))
+
+qc_simple
+
+##making violin plots of new qc data
+qc_merge <- merge(
+  seurat_list_clean[[1]],
+  seurat_list_clean[-1],
+  add.cell.ids = names(seurat_list_clean)
+)
+
+VlnPlot(
+  qc_merge,
+  features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+  group.by = "sample",
+  ncol = 3,
+  pt.size = 0
+) + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+##removing bad samples (low cell numbers (AD6,NC11)low nfeature and nCount (NC16))
+drop_now <- c("AD6","NC11", "NC16")
+seurat_list_clean <- seurat_list_clean[setdiff(names(seurat_list_clean), drop_now)]
+```
+
+## 2. Global integration, cluster identification, and astrocyte selection 
+
+```{r}
+##Merge remaining good samples that passed qc
+merged_clean <- merge(x = seurat_list_clean[[1]], y = seurat_list_clean[-1], add.cell.ids = names(seurat_list_clean))
+DefaultAssay(merged_clean) <- "RNA"
+
+merged_clean <- NormalizeData(merged_clean, scale.factor = 1e4, verbose = FALSE)
+merged_clean <- FindVariableFeatures(merged_clean, selection.method = "vst", nfeatures = 3000, verbose = FALSE)
+merged_clean <- ScaleData(merged_clean, features = VariableFeatures(merged_clean),
+                          vars.to.regress = c("nCount_RNA"), verbose = TRUE)
+merged_clean <- RunPCA(merged_clean, npcs = 50, verbose = FALSE)
+
+#Extract PCA embeddings 
+pca_embeddings <- Embeddings(merged_clean, "pca")
+
+#Run Harmony on sample
+harmony_embeddings <- HarmonyMatrix(
+  data_mat  = pca_embeddings,
+  meta_data = merged_clean@meta.data,
+  vars_use  = "sample",
+  do_pca    = FALSE,
+  theta     = 2        
+)
+
+# Store Harmony back into Seurat object
+merged_clean[["harmony"]] <- CreateDimReducObject(
+  embeddings = harmony_embeddings,
+  key = "harmony_",
+  assay = DefaultAssay(merged_clean)
+)
+
+#Find Neighbors, cluster, UMAP
+dims_use <- 1:20
+merged_clean <- FindNeighbors(merged_clean, reduction = "harmony", dims = dims_use, k.param = 50)
+merged_clean <- FindClusters(merged_clean, resolution = 0.2, algorithm = 1, random.seed = 1234)
+merged_clean <- RunUMAP(merged_clean, reduction = "harmony", dims = dims_use, seed.use = 1234)
+
+##visualize astrocyte clusters
+DimPlot(merged_clean, group.by = "seurat_clusters", label = TRUE, repel = TRUE, raster = TRUE)
+
+##Figure S1A
+FeaturePlot(
+  merged_clean,
+  features = c("GFAP", "AQP4", "ALDH1L1"),
+  reduction = "umap",
+  cols = c("grey90", "red"),
+  raster = TRUE,
+  ncol = 3
+)
+
+##labeling astrocyte cluster (here cluster2)
+# Rename clusters (keep all others numeric)
+new.ids <- as.character(Idents(merged_clean))
+new.ids[new.ids == "2"] <- "Astrocytes"
+merged_clean$celltype <- factor(new.ids)
+
+##labeling astrocyte cluster in all cell UMAP
+##UMAP with astrocyte cluster labled
+#part of Figure 1A
+astro_cells <- WhichCells(merged_clean, idents = "2")
+
+p <- DimPlot(
+  merged_clean,
+  group.by        = "seurat_clusters",
+  cells.highlight = list(Astrocytes = astro_cells),
+  cols            = c("grey60", "red"),
+  reduction       = "umap",
+  pt.size         = 0.5,
+  sizes.highlight = 0.5,
+  raster          = TRUE
+) +
+  theme(legend.position = "none") +
+  ggtitle("")
+
+# get cluster centroid and move label slightly above
+centroid <- colMeans(Embeddings(merged_clean, "umap")[astro_cells, , drop = FALSE])
+p <- p + annotate(
+  "text",
+  x = centroid[1],
+  y = centroid[2] + 5,          #move label up (adjust as needed)
+  label = "Astrocytes",
+  color = "red",
+  fontface = 2,
+  size = 5
+)
+
+p
+```
+
+## 3. Astrocyte re-integration, subclusters, and CXCL14 feature plots
+
+```{r}
+##subsetting astrocytes (cluster 2)
+# Ensure Idents are the clustering labels you just made
+Idents(merged_clean) <- "seurat_clusters"
+
+# Grab astrocyte cells from cluster "2"
+astro_cells <- WhichCells(merged_clean, idents = "2")
+
+# Subset object
+astro <- subset(merged_clean, cells = astro_cells)
+
+# Optional tidy-up
+astro$celltype <- "Astrocyte"
+astro <- DietSeurat(astro, counts = TRUE, data = TRUE, scale.data = FALSE)
+
+##processing astrocytes subset
+DefaultAssay(astro) <- "RNA"
+
+# QC covariates 
+vars_to_regress <- c("nCount_RNA", "percent.mt")
+
+astro <- NormalizeData(astro, scale.factor = 1e4, verbose = FALSE)
+astro <- FindVariableFeatures(astro, selection.method = "vst", nfeatures = 3000, verbose = FALSE)
+astro <- ScaleData(astro, features = VariableFeatures(astro), vars.to.regress = vars_to_regress, verbose = TRUE)
+astro <- RunPCA(astro, npcs = 50, verbose = FALSE)
+
+# keep a safe sample column for Harmony
+if (!"sample" %in% colnames(astro@meta.data)) astro$sample <- astro$orig.ident
+
+# Harmony on sample
+astro_harm <- HarmonyMatrix(
+  data_mat  = Embeddings(astro, "pca"),
+  meta_data = astro@meta.data,
+  vars_use  = "sample",
+  do_pca    = FALSE,
+  theta     = 2
+)
+astro[["harmony"]] <- CreateDimReducObject(embeddings = astro_harm, key = "harmony_", assay = DefaultAssay(astro))
+
+# Neighbors / clustering / UMAP
+dims_use <- 1:20
+astro <- FindNeighbors(astro, reduction = "harmony", dims = dims_use, k.param = 30)
+astro <- FindClusters(astro, resolution = 0.3, algorithm = 1, random.seed = 1234)
+astro <- RunUMAP(astro, reduction = "harmony", dims = dims_use, seed.use = 1234)
+
+
+DimPlot(astro, group.by = "seurat_clusters", 
+        label = TRUE, repel = TRUE, pt.size = 0.5)
+
+FeaturePlot(
+  merged_clean,
+  features = c("GFAP", "AQP4", "ALDH1L1"),
+  reduction = "umap",
+  cols = c("grey90", "red"),
+  raster = TRUE,
+  ncol = 3
+)
+
+##plotting astro subclusters by condition
+#Figure S1B
+astro$condition <- merged_clean$condition[Cells(astro)]
+table(astro$condition, useNA = "ifany")
+
+
+astro$condition <- factor(astro$condition, levels = c("NC","AD"))
+
+# Make sure Idents are clusters
+Idents(astro) <- "seurat_clusters"
+
+# Split UMAP by condition
+p <- DimPlot(
+  astro,
+  group.by   = "seurat_clusters",
+  split.by   = "condition",
+  label      = TRUE,
+  repel      = TRUE,
+  pt.size    = 0.5,
+  ncol       = 2
+)
+p
+
+##2 umaps of cxcl14 by condition with proper legend
+##Figure 1B
+# common limits so both panels share the same legend/scale
+cx <- FetchData(astro, "CXCL14")[,1]
+lims <- quantile(cx, c(0, 1), na.rm = TRUE)
+
+# split the object once
+astro_nc <- subset(astro, subset = condition == "NC")
+astro_ad <- subset(astro, subset = condition == "AD")
+
+base_fp <- function(obj, title){
+  FeaturePlot(obj, features = "CXCL14", order = TRUE, pt.size = 0.5) +
+    scale_color_gradient(low = "grey90", high = "blue",
+                         name = "CXCL14", limits = lims, oob = scales::squish) +
+    ggtitle(title) +
+    labs(x = "umap_1", y = "umap_2") +
+    theme_classic(base_size = 12) +
+    theme(
+      plot.title      = element_text(size = 16, face = "bold", hjust = 0.5),
+      legend.position = "right",
+      axis.text       = element_text(color = "black"),
+      axis.ticks      = element_line(color = "black")
+    )
+}
+
+p_nc <- base_fp(astro_nc, "NC")
+p_ad <- base_fp(astro_ad, "AD")
+
+(p_nc | p_ad) + plot_layout(guides = "collect")
+```
+
+## 4. CXCL14-positive nuclei, cluster markers, and state annotation 
+
+```{r}
+###Extract %CXCL14 positive astrocyte per sample/condition
+#RNA assay (log-normalized counts)
+DefaultAssay(astro) <- "RNA"
+
+# Create a binary TRUE/FALSE for expression > 0
+astro$CXCL14_pos <- FetchData(astro, "CXCL14")[, 1] > 0
+cxcl14_summary <- astro@meta.data %>%
+  group_by(condition, sample) %>%
+  summarise(
+    total_cells = n(),
+    cxcl14_pos  = sum(CXCL14_pos),
+    percent_pos = 100 * cxcl14_pos / total_cells
+  ) %>%
+  arrange(condition, desc(percent_pos))
+
+cxcl14_summary
+
+##Findmarkers for each astrocyte subcluster
+##findmarkers to define each subcluster
+DefaultAssay(astro) <- "RNA"   
+Idents(astro) <- "seurat_clusters"
+
+astro <- JoinLayers(astro, assay = "RNA")
+cluster_markers <- FindAllMarkers(
+  astro,
+  only.pos        = TRUE,
+  min.pct         = 0.10,       
+  logfc.threshold = 0.10,
+  test.use        = "wilcox",
+  layer           = "data"      # v5: be explicit after JoinLayers
+)
+
+# Top 10 per cluster
+top20 <- cluster_markers %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = 20) %>%
+  ungroup()
+
+astro@meta.data %>%
+  group_by(sample, condition, seurat_clusters) %>%
+  summarise(n=n()) %>%
+  group_by(sample, condition) %>%
+  mutate(prop = n/sum(n)) %>%
+  ggplot(aes(x=seurat_clusters, y=prop, fill=condition)) +
+  geom_boxplot(outlier.shape=NA, alpha=0.7) +
+  geom_jitter(width=0.2, size=1) +
+  theme_classic()
+
+
+
+##comparing cxcl14 expression in only cxcl14 positive astrocytes between NC and AD
+# Make sure you have CXCL14 expression values
+astro$CXCL14_expr <- FetchData(astro, "CXCL14")[,1]
+
+# Filter only CXCL14-positive astrocytes and summarize by sample
+cxcl14_avg_pos <- astro@meta.data %>%
+  filter(CXCL14_expr > 0) %>%
+  group_by(sample, condition) %>%
+  summarise(mean_CXCL14 = mean(CXCL14_expr, na.rm = TRUE),
+            median_CXCL14 = median(CXCL14_expr, na.rm = TRUE),
+            n_pos_cells = n()) %>%
+  ungroup()
+
+cxcl14_avg_pos
+
+##filtering out samples with less than 40 cxcl14 positive
+cxcl14_avg_pos_filtered <- cxcl14_avg_pos %>%
+  filter(n_pos_cells >= 40)
+
+cxcl14_avg_pos_filtered %>%
+  count(condition)
+
+
+```
+
+## 5. Balanced NC CXCL14-positive vs CXCL14-negative astrocytes
+
+```{r}
+##comparing cxcl14- to cxcl14+ astrocytes in NC CTX
+set.seed(42)
+DefaultAssay(astro) <- "RNA"
+
+# 1) Ensure CXCL14_pos exists (TRUE/FALSE) and keep only NC
+if (is.null(astro$CXCL14_pos)) {
+  astro$CXCL14_pos <- FetchData(astro, "CXCL14")[, 1] > 0
+}
+astro_nc <- subset(astro, subset = condition == "NC")
+
+# 2) Per-sample exact balancing: n_pos = n_neg (per sample)
+keep_cells <- unlist(lapply(split(colnames(astro_nc), astro_nc$sample), function(cells_samp) {
+  pos <- cells_samp[ astro_nc$CXCL14_pos[cells_samp] ]
+  neg <- cells_samp[ !astro_nc$CXCL14_pos[cells_samp] ]
+
+  if (length(pos) == 0 || length(neg) == 0) return(character(0))  # skip if one group absent
+
+  n <- min(length(pos), length(neg))  # exact match per sample
+  c(sample(pos, n), sample(neg, n))
+}), use.names = FALSE)
+
+##balanced number of cxcl14+ and cxcl14- astrocytes per sample
+astro_nc_bal <- subset(astro_nc, cells = keep_cells)
+
+# quick check (each row should have equal TRUE/FALSE counts)
+table(astro_nc_bal$sample, astro_nc_bal$CXCL14_pos)
+
+# 3) Label groups and run DE
+astro_nc_bal$Group <- ifelse(astro_nc_bal$CXCL14_pos, "CXCL14_pos", "CXCL14_neg")
+Idents(astro_nc_bal) <- "Group"
+```
+
+## 6. NC CXCL14-positive vs negative differential expression and GO:BP GSEA (Figure S1F)
+
+```{r}
+##pathway analysis for cxcl14+ vs cxcl14- astrocytes in NC patients
+##NC pos vs neg
+de_nc <- FindMarkers(
+  astro_nc_bal,
+  ident.1 = "CXCL14_pos",
+  ident.2 = "CXCL14_neg",
+  test.use = "wilcox",
+  min.pct = 0.05,
+  logfc.threshold = 0
+)
+de_nc_all <- de_nc
+ranks_df <- de_nc %>%
+  tibble::rownames_to_column("gene") %>%
+  mutate(rank = sign(avg_log2FC) * -log10(p_val + 1e-300)) %>%
+  filter(!gene %in% c("CXCL14")) %>%                      # <- exclude marker(s)
+  arrange(desc(rank)) %>%
+  distinct(gene, .keep_all = TRUE)
+
+geneList <- setNames(ranks_df$rank, ranks_df$gene)
+geneList <- sort(geneList, decreasing = TRUE)
+ego_gsea <- gseGO(
+  geneList      = geneList,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",
+  ont           = "BP",
+  minGSSize     = 20,
+  maxGSSize     = 500,
+  pvalueCutoff  = 0.05,
+  verbose       = FALSE
+)
+
+# Reduce redundancy (GO-only)
+ego_gsea_slim <- simplify(
+  ego_gsea,
+  cutoff     = 0.7,     # 0.5–0.7 typical; higher = more aggressive pruning
+  by         = "p.adjust",
+  select_fun = min,
+  measure    = "Wang"
+)
+
+#Make term gene lists readable (ENTREZ -> SYMBOL)
+# gseGO above used keyType = "SYMBOL"; pathways are already gene-symbol based.
+# Original script called setReadable(..., keyType = "ENTREZID"), which is
+# inconsistent here. Omitted to prevent incorrect identifier conversion.
+
+
+res <- ego_gsea_slim   
+
+res_tbl   <- as.data.frame(res@result) %>% filter(!is.na(NES))
+
+
+###exporting pathways
+##exporting pathway list
+to_df <- function(x) {
+  if (is.data.frame(x)) x else as.data.frame(x@result)
+}
+
+gsea_df <- to_df(ego_gsea_slim)
+
+gsea_pos <- gsea_df %>% filter(NES > 0)
+gsea_neg <- gsea_df %>% filter(NES < 0)
+
+write_xlsx(
+  list(
+    CXCL14_pos_enriched = gsea_pos,
+    CXCL14_neg_enriched = gsea_neg
+  ),
+  path = "CXCL14_GSEA_GO_BP_slim.xlsx"
+)
+
+##pathway barplot
+##barplot NES on x-axis, color by -log p-value
+res_tbl <- as.data.frame(res@result) %>%
+  filter(!is.na(NES))
+
+plot_df <- as.data.frame(res@result) |>
+  dplyr::filter(!is.na(NES), NES > 0) |>
+  dplyr::mutate(
+    neglog10padj = -log10(p.adjust),
+    Description  = stringr::str_to_sentence(Description)
+  ) |>
+  dplyr::arrange(NES) |>
+  dplyr::slice_tail(n = 10) |>
+  dplyr::mutate(
+    Description = factor(Description, levels = Description)
+  )
+
+###Figure S1F
+ggplot(plot_df, aes(x = NES, y = Description, fill = neglog10padj)) +
+  geom_col(width = 0.8) +
+  scale_fill_viridis_c(
+    option = "viridis",
+    name = expression(-log[10]("adjusted p-value"))
+  ) +
+  labs(
+    x = "NES",
+    y = NULL
+   
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    plot.title  = element_text(face = "bold"),
+    axis.text.y = element_text(size = 20, face = "bold", color = "black")
+  )
+```
+
+## 7. NC CXCL14-positive vs negative selected marker dot plot 
+
+```{r}
+##dotplot for genes of interest from pathway analysis between CXCL14+ and CXCL14- NC astrocytes
+obj <- astro_nc_bal
+group_col <- "Group"
+
+genes_list <- list(
+  "Homeostasis" = c("AQP4","SLC1A2","SLC1A3","CST3","VIM","GJA1"),
+  "Detoxification" = c("SOD3","MT1E","PRDX1","SESN1"),
+  "Vascular interaction" = c("ATP1B2","SLC15A2","SLC6A1","ATP8A1"),
+  "Amyloid-beta clearance" = c("APOE","CLU","LRP1","RAB11A")
+)
+
+# keep only genes present
+genes_list <- lapply(genes_list, function(g) intersect(g, rownames(obj)))
+features <- unlist(genes_list, use.names = FALSE)
+
+# set Group order (edit labels to match your meta exactly)
+obj@meta.data[[group_col]] <- factor(obj@meta.data[[group_col]],
+                                     levels = c("CXCL14_pos", "CXCL14_neg"))
+
+# mapping gene -> category (facet strip)
+gene2cat <- stack(genes_list) %>% rename(Gene = values, Category = ind)
+
+# base DotPlot
+p <- DotPlot(
+  obj,
+  features = features,
+  group.by = group_col,
+  assay = DefaultAssay(obj)
+)
+
+# Assign gene categories once and preserve requested gene ordering.
+pd <- p$data %>%
+  left_join(gene2cat, by = c("features.plot" = "Gene")) %>%
+  mutate(
+    Category = factor(Category, levels = names(genes_list)),
+    features.plot = factor(
+      features.plot,
+      levels = unlist(lapply(names(genes_list), function(ct) rev(genes_list[[ct]])))
+    )
+  )
+
+pd_facet <- pd %>%
+  group_by(Category) %>%
+  mutate(
+    avg_exp_facet_scaled = scales::rescale(avg.exp)
+  ) %>%
+  ungroup()
+
+###Figure S1G
+ggplot(pd_facet, aes(x = id, y = features.plot)) +
+  geom_point(aes(size = pct.exp, color = avg_exp_facet_scaled)) +
+  facet_grid(
+    rows = vars(Category),
+    scales = "free_y",
+    space  = "free_y",
+    switch = "y"
+  ) +
+  scale_color_viridis_c(
+    option = "plasma",
+    name = "Relative expression (within pathway)"
+  ) +
+  scale_size(range = c(1.5, 7), name = "Percent expressed") +
+  labs(x = "Group", y = "Genes") +
+  theme_bw(base_size = 14) +
+  theme(
+    strip.background   = element_rect(fill = "grey90", color = NA),
+    strip.text.y.left  = element_text(size = 16, face = "bold"),
+    axis.text.x        = element_text(angle = 45, hjust = 1)
+  )+ scale_x_discrete(
+    labels = c(
+      CXCL14_pos = "CXCL14+ astrocytes",
+      CXCL14_neg = "CXCL14- astrocytes"
+    )
+  ) +
+  theme(
+    strip.text.y.left = element_text(size = 16, face = "bold"),
+    axis.text.y       = element_text(size = 12, face = "bold", color = "black"),
+    axis.text.x       = element_text(size = 13, face = "bold"),
+    axis.title.x      = element_text(size = 13, face = "bold"),
+    axis.title.y      = element_text(size = 13, face = "bold")
+  )+ theme(
+    strip.placement  = "outside",
+    strip.text.y.left = element_text(size = 14, face = "bold")
+  )
+```
+
+## 8. AD versus NC CXCL14-positive astrocytes: selection
+
+```{r}
+##analyzing CXCL14+ astrocytes between NC and AD
+DefaultAssay(astro) <- "RNA"
+
+#  Define CXCL14_pos 
+if (is.null(astro$CXCL14_pos)) {
+  astro$CXCL14_pos <- FetchData(astro, "CXCL14")[, 1] > 0
+}
+
+#  Subset ONLY CXCL14+ astrocytes
+astro_pos <- subset(astro, subset = CXCL14_pos == TRUE)
+```
+
+## 9. AD versus NC CXCL14-positive astrocytes: differential expression, ORA and redundancy pruning 
+
+```{r}
+##pathway analysis
+#findmarkers between cxcl14 positive astrocytes in AD vs NC, only used samples with >40 positive astrocytes
+## Keep only samples with ≥ 40 CXCL14+ cells (within astro_pos)
+sample_counts <- astro_pos@meta.data %>% count(sample, name = "n_cells")
+keep_samples  <- sample_counts %>% filter(n_cells >= 40) %>% pull(sample)
+
+astro_pos_filt <- subset(astro_pos, subset = sample %in% keep_samples)
+
+cat("Kept", length(keep_samples), "samples; total cells:",
+    ncol(astro_pos_filt), "\n")
+
+##Make sure the comparison groups are exactly 'NC' and 'AD'
+
+cond_levels <- levels(factor(astro_pos_filt$condition))
+cond_levels
+
+if (all(c("ND","AD") %in% cond_levels) && !"NC" %in% cond_levels) {
+  astro_pos_filt$condition <- factor(replace(astro_pos_filt$condition,
+                                             astro_pos_filt$condition == "ND", "NC"))
+}
+astro_pos_filt$condition <- factor(astro_pos_filt$condition, levels = c("NC","AD"))
+
+##Set identities to condition (or use group.by in FindMarkers)
+Idents(astro_pos_filt) <- "condition"
+table(Idents(astro_pos_filt))
+
+de_pos_AD_vs_NC <- FindMarkers(
+  object          = astro_pos_filt,
+  ident.1         = "AD",
+  ident.2         = "NC",
+  test.use        = "wilcox",
+  min.pct         = 0.10,        
+  logfc.threshold = 0            
+)
+
+
+##ORA
+##ORA on cxcl14 pos AD vs NC - using top500 ranked up and down by logfoldchange
+# prep DE results
+de_tbl <- de_pos_AD_vs_NC %>%
+  rownames_to_column("gene")
+
+N <- 500  
+up_genes <- de_tbl %>%
+  dplyr::arrange(dplyr::desc(avg_log2FC)) %>%
+  dplyr::filter(avg_log2FC > 0) %>%
+  dplyr::slice_head(n = N) %>% dplyr::pull(gene)
+
+down_genes <- de_tbl %>%
+  dplyr::arrange(avg_log2FC) %>%
+  dplyr::filter(avg_log2FC < 0) %>%
+  dplyr::slice_head(n = N) %>% dplyr::pull(gene)
+
+length(up_genes); length(down_genes)
+
+ego_up <- enrichGO(
+  gene          = up_genes,
+  
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  qvalueCutoff  = 0.25,
+  readable      = TRUE
+)
+
+ego_down <- enrichGO(
+  gene          = down_genes,
+ 
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  qvalueCutoff  = 0.25,
+  readable      = TRUE
+)
+
+
+###simplifying pathways, consolidating similar redundent ones
+
+simplify_by_jaccard <- function(ego, sim_cut = 0.4, min_cluster_size = 1) {
+  if (is.null(ego) || nrow(as.data.frame(ego)) == 0) return(ego)
+  
+  # make sure it’s a data.frame 
+  df <- as.data.frame(ego)
+  rownames(df) <- df$ID
+  
+  # compute Jaccard matrix
+  jaccard_mat <- function(geneID_vec_named) {
+    sets <- lapply(geneID_vec_named, function(x) unique(strsplit(x, "/")[[1]]))
+    ids  <- names(sets)
+    n    <- length(sets)
+    M <- matrix(0, n, n, dimnames = list(ids, ids))
+    for (i in seq_len(n)) {
+      Si <- sets[[i]]
+      for (j in i:n) {
+        Sj <- sets[[j]]
+        inter <- length(intersect(Si, Sj))
+        uni   <- length(union(Si, Sj))
+        M[i, j] <- M[j, i] <- if (uni == 0) 0 else inter / uni
+      }
+    }
+    M
+  }
+  
+  J <- jaccard_mat(stats::setNames(df$geneID, df$ID))
+  dist_obj <- as.dist(1 - J)
+  hc <- hclust(dist_obj, method = "average")
+  cl <- cutree(hc, h = 1 - sim_cut)
+  df$cluster <- cl
+  
+  # pick representative term per cluster
+  reps <- df %>%
+    dplyr::group_by(cluster) %>%
+    dplyr::arrange(p.adjust, .by_group = TRUE) %>%
+    dplyr::slice(1) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(is_representative = TRUE) %>%
+    dplyr::select(ID, cluster, is_representative)
+  
+  df2 <- dplyr::left_join(df, reps, by = c("ID","cluster")) %>%
+    dplyr::mutate(is_representative = ifelse(is.na(is_representative), FALSE, is_representative))
+  
+  keep_clusters <- df2 %>% dplyr::count(cluster, name = "size") %>%
+    dplyr::filter(size >= min_cluster_size) %>% dplyr::pull(cluster)
+  df2 <- df2 %>% dplyr::filter(cluster %in% keep_clusters)
+  
+  df_rep <- df2 %>% dplyr::filter(is_representative) %>%
+    dplyr::arrange(p.adjust)
+  
+  df_rep
+}
+
+
+## Run simplification ----
+ego_up_simple   <- simplify_by_jaccard(ego_up,   sim_cut = 0.3) 
+ego_down_simple <- simplify_by_jaccard(ego_down, sim_cut = 0.8)
+```
+
+## 10. Export ORA results
+
+```{r}
+##Export pathway lists
+to_df <- function(x) {
+  if (is.data.frame(x)) x else as.data.frame(x@result)
+}
+
+up_df   <- to_df(ego_up_simple)
+down_df <- to_df(ego_down_simple)
+
+write_xlsx(
+  list(
+    Upregulated_Pathways   = up_df,
+    Downregulated_Pathways = down_df
+  ),
+  path = "CXCL14_ORA_pathways.xlsx"
+)
+```
+
+## 11. ORA bar plots 
+
+```{r}
+##plotting pathways
+##Figure 1E
+make_ora_barplot <- function(x, n = 10,
+                             x_axis = c("Count", "GeneRatio"),
+                             padj_col = "p.adjust") {
+  x_axis <- match.arg(x_axis)
+
+  # Accept either enrichResult/gseaResult OR data.frame
+  df <- if (is.data.frame(x)) x else as.data.frame(x@result)
+  stopifnot(padj_col %in% colnames(df))
+
+  df <- df %>%
+    filter(!is.na(.data[[padj_col]])) %>%
+    mutate(
+      neglog10padj = -log10(.data[[padj_col]]),
+      Description  = stringr::str_to_sentence(Description),
+      # Fix acronyms AFTER sentence-casing
+      Description  = gsub("\\batp\\b", "ATP", Description, ignore.case = TRUE)
+    )
+
+  # Choose x variable
+  if (x_axis == "GeneRatio") {
+    if (!("GeneRatio" %in% colnames(df))) stop("No GeneRatio column found.")
+    df <- df %>%
+      mutate(GeneRatioNum = sapply(GeneRatio, function(gr) {
+        parts <- strsplit(as.character(gr), "/")[[1]]
+        as.numeric(parts[1]) / as.numeric(parts[2])
+      }))
+    x_var <- "GeneRatioNum"
+  } else {
+    if (!("Count" %in% colnames(df))) stop("No Count column found.")
+    x_var <- "Count"
+  }
+
+  # Build plot df
+  plot_df <- df %>%
+    arrange(desc(.data[[x_var]])) %>%
+    slice_head(n = n) %>%
+    mutate(Description = factor(Description, levels = rev(Description)))
+
+  ggplot(plot_df, aes(x = .data[[x_var]], y = Description, fill = neglog10padj)) +
+    geom_col(width = 0.8) +
+    scale_fill_viridis_c(
+      option = "viridis",
+      name = expression(-log[10]("adjusted p-value"))
+    ) +
+    labs(
+      x = ifelse(x_axis == "Count", "Number of overlapping genes", "Gene ratio"),
+      y = NULL
+    ) +
+    theme_classic(base_size = 14) +
+    theme(axis.text.y = element_text(size = 20, face = "bold", color = "black"))
+}
+
+p_up   <- make_ora_barplot(ego_up_simple,   n = 10, x_axis = "Count")
+p_down <- make_ora_barplot(ego_down_simple, n = 8, x_axis = "Count")
+
+p_up
+p_down
